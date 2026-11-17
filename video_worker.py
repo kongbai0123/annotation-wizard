@@ -161,10 +161,11 @@ def process_video(cv2, capture, model, tracker, device: str, output: Path,
             raise ValueError("影片中途變更解析度，請先轉成固定解析度。")
         msec = frame_time(capture.get(cv2.CAP_PROP_POS_MSEC), last_msec, fps)
         last_msec = msec
-        result = model.predict(source=frame, device=device, conf=min(confidence, 0.1), save=False,
-                               verbose=False, project=str(output), name="runtime", exist_ok=True)[0]
-        boxes = result.boxes.cpu().numpy()
-        tracks = tracker.update(boxes, frame)
+        if model is not None:
+            result = model.predict(source=frame, device=device, conf=min(confidence, 0.1), save=False,
+                                   verbose=False, project=str(output), name="runtime", exist_ok=True)[0]
+            boxes = result.boxes.cpu().numpy()
+            tracks = tracker.update(boxes, frame)
 
         if effective_fps == fps or msec + 0.01 >= next_sample_msec:
             if len(frames) >= MAX_SAMPLED_FRAMES:
@@ -178,15 +179,17 @@ def process_video(cv2, capture, model, tracker, device: str, output: Path,
             if staged_bytes > MAX_FRAME_BYTES:
                 raise ValueError("畫格暫存已超過 8 GiB，請降低取樣率或縮短影片。")
             (output / rel_path).write_bytes(pixels)
+            annotations = [] if model is None else frame_annotations(boxes, result.names, tracks, width, height, confidence)
             frames.append({"file": rel_path, "frame_index": count, "time_ms": round(msec, 3), "width": width,
                            "height": height, "sha256": hashlib.sha256(pixels).hexdigest(),
-                           "boxes": frame_annotations(boxes, result.names, tracks, width, height, confidence)})
+                           "boxes": annotations})
             next_sample_msec = (math.floor((msec + 0.01) / period) + 1) * period
 
         count += 1
         tick = time.monotonic()
         if tick - last_progress >= 0.25:
-            emit("progress", stage="tracking", frames_read=count, total_frames=total, frames_sampled=len(frames))
+            emit("progress", stage="sampling" if model is None else "tracking", frames_read=count,
+                 total_frames=total, frames_sampled=len(frames))
             last_progress = tick
 
     if not frames or dimensions is None:
@@ -205,36 +208,42 @@ def execute(args) -> None:
     if args.device not in ("auto", "cpu") and not re.fullmatch(r"[0-9]+", args.device):
         raise ValueError("運算裝置需為 auto、cpu 或 CUDA 裝置編號。")
     video = local_path(args.video, must_exist=True)
-    model_path = local_path(args.model, must_exist=True)
+    if not args.keyframes and (args.model is None or args.approved_model_sha256 is None):
+        raise ValueError("自動偵測需要已確認的 YOLO 模型。")
+    model_path = None if args.keyframes else local_path(args.model, must_exist=True)
     if not video.is_file() or video.suffix.lower() not in VIDEO_EXTENSIONS:
         raise ValueError("請選擇支援的本機影片檔。")
-    if not model_path.is_file() or model_path.suffix.lower() != ".pt":
+    if model_path is not None and (not model_path.is_file() or model_path.suffix.lower() != ".pt"):
         raise ValueError("請選擇預先準備好的本機 YOLO .pt 偵測權重。")
     destination = local_path(args.out, must_exist=False)
     emit("progress", stage="verifying", frames_read=0, total_frames=None, frames_sampled=0)
     source = verify_approved(video, args.approved_sha256, "影片")
-    model_info = verify_approved(model_path, args.approved_model_sha256, "模型")
+    model_info = verify_approved(model_path, args.approved_model_sha256, "模型") if model_path else None
 
     destination.mkdir(parents=True, exist_ok=True)
     if any(destination.iterdir()):
         raise ValueError("請使用新的空白暫存資料夾。")
-    install_local_guard(model_path, destination)
+    if model_path:
+        install_local_guard(model_path, destination)
     import cv2
 
     capture = cv2.VideoCapture(str(video))
     try:
         if not capture.isOpened():
             raise RuntimeError("此影片無法開啟，請檢查檔案格式和編碼。")
-        model, tracker, device = load_detector_and_tracker(model_path, args.device)
+        model, tracker, device = load_detector_and_tracker(model_path, args.device) if model_path else (None, None, None)
         info, frames = process_video(cv2, capture, model, tracker, device, destination, args.sample_fps, args.conf)
     finally:
         capture.release()
 
     # Never publish a completed result if the approved files changed mid-run.
     verify_approved(video, args.approved_sha256, "影片")
-    verify_approved(model_path, args.approved_model_sha256, "模型")
+    if model_path:
+        verify_approved(model_path, args.approved_model_sha256, "模型")
     manifest = {"schema_version": 1, "source": {**source, **info}, "model": model_info, "tracker": "bytetrack",
                 "sample_fps": args.sample_fps, "conf": args.conf, "frames": frames}
+    if args.keyframes:
+        manifest.update(mode="keyframes", tracker=None)
     temporary = destination / ".result.json.tmp"
     with temporary.open("x", encoding="utf-8", newline="\n") as handle:
         json.dump(manifest, handle, ensure_ascii=False, allow_nan=False)
@@ -248,13 +257,14 @@ def execute(args) -> None:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--video", type=Path, required=True)
-    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--model", type=Path)
+    parser.add_argument("--keyframes", action="store_true")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--sample-fps", type=float, default=1.0)
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--approved-sha256", "--approved-video-sha256", dest="approved_sha256", required=True)
-    parser.add_argument("--approved-model-sha256", required=True)
+    parser.add_argument("--approved-model-sha256")
     args = parser.parse_args(argv)
     try:
         execute(args)

@@ -19,6 +19,8 @@ Windows 偵測框標註工具。雙擊 `AnnotationWizard.exe` 開啟繁體中文
 
 ## 影片自動標註
 
+若要自己選用文字候選框，先在影片預覽勾選「只匯入關鍵畫格」。預設每秒擷取一張，可調，這個模式可直接使用本機影片。
+
 1. 開啟專案後按「影片自動標註」，選擇要審查的原始影片。可看不同時間點的畫面，或按「播放原片」核對拍攝是否連續。
 2. 選擇你信任、類別符合該影片的本機 YOLO Detect `.pt` 模型，設定要保存的畫格率和信心門檻。審查完成再按「確認影片並匯入」。審查階段只讀取影片和模型檔案，確認後會再次核對檔案雜湊，再啟動推論。
 3. 程式逐幀執行 YOLO 偵測和 ByteTrack，再依設定儲存取樣畫格。影格保留原片資訊、時間；候選框保留類別、信心分數和可用的追蹤 ID。同一影片的同一畫格重複匯入時保留原標註。
@@ -30,6 +32,12 @@ Windows 偵測框標註工具。雙擊 `AnnotationWizard.exe` 開啟繁體中文
 $VideoPython = 'D:\software\vision-workbench\.venv-models\ultralytics\Scripts\python.exe'
 & $VideoPython -m pip install --only-binary=:all: --no-deps --target .video-deps lap==0.5.13
 ```
+
+## 文字候選框
+
+在「偵測框」模式輸入物件名稱，例如 `car door`，按「找框」。從最多五個候選中選擇預覽，可拖四角微調。選好類別後按「儲存框」，才會成為標註。
+
+程式使用同層獨立的 `MM-Grounding-DINO-Tiny` 資料夾，也可用 `ANNOTATION_WIZARD_DINO_DIR` 指定本機路徑。需要官方 O365＋GoldG 快照（修訂 `80b3081e63ff7c265a9b404296d848f0f0aa0006`）及本機 `health/manifest.json` 對照集。對照集為 JSON 陣列，記錄 `file`、`sha256`、`prompt`（`person` 或 `car`）和原圖像素座標 `xyxy`，圖片放在同一個 `health` 資料夾。權重、輸出頭及對照推論通過驗證後才顯示候選。模型與測試圖由本機載入。
 
 ## 重建執行環境
 

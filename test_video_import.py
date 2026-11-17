@@ -85,6 +85,21 @@ class VideoImportTests(unittest.TestCase):
                 self.import_result(source, model)
             self.assertEqual(self.snapshot(), before)
 
+    def test_keyframes_require_no_model_and_preserve_empty_review(self):
+        before = self.snapshot()
+        self.manifest.update(mode="keyframes", model=None)
+        self.write_manifest()
+        with self.assertRaises(ValueError):
+            self.import_result(model_sha=None)
+        self.assertEqual(self.snapshot(), before)
+        self.manifest["frames"][0]["boxes"] = []
+        self.write_manifest()
+        self.assertEqual(self.import_result(model_sha=None)["imported_frames"], 2)
+        restored = Project.open(self.project.directory)
+        self.assertEqual([a["video"]["frame_index"] for a in restored.assets], [0, 5])
+        self.assertTrue(all(a["video"]["keyframe"] and not a["reviewed"] and not a["annotations"]
+                            for a in restored.assets))
+
     def test_staging_rolls_back_if_later_frame_is_tampered_or_escapes_directory(self):
         self.project.add_label("保留原類別")
         before = self.snapshot()

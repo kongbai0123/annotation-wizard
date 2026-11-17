@@ -302,7 +302,7 @@ class Project:
             raise
 
     def import_video_annotations(self, manifest_path: Path, *, approved_video_sha256: str,
-                                 approved_model_sha256: str) -> dict[str, int]:
+                                 approved_model_sha256: str | None) -> dict[str, int]:
         """Commit a completed, approved worker result as pending video frames."""
         manifest_path = Path(manifest_path).resolve(strict=True)
         try:
@@ -314,7 +314,10 @@ class Project:
             raise ValueError("不支援此影片處理結果格式。")
         source_info = manifest.get("source")
         source = _video_origin(source_info, "影片", approved_video_sha256)
-        model = _video_origin(manifest.get("model"), "模型", approved_model_sha256)
+        keyframes = manifest.get("mode") == "keyframes"
+        if keyframes != (approved_model_sha256 is None) or (keyframes and manifest.get("model") is not None):
+            raise ValueError("影片處理模式與確認內容不符。")
+        model = None if keyframes else _video_origin(manifest.get("model"), "模型", approved_model_sha256)
         dimensions = (source_info.get("width"), source_info.get("height"))
         fps = _finite(source_info.get("fps"), "幀率")
         frame_count = source_info.get("frame_count")
@@ -357,7 +360,13 @@ class Project:
                         "video": {**source, "frame_index": index, "time_ms": time_ms, "fps": fps,
                                   "sample_fps": sample_fps, "conf": confidence, "model": model},
                     }
-                    asset["annotations"] = _video_annotations(row.get("boxes"), asset, model_labels)
+                    if keyframes:
+                        if row.get("boxes") != []:
+                            raise ValueError("關鍵畫格匯入含有未確認的標註。")
+                        asset["video"]["keyframe"] = True
+                        asset["annotations"] = []
+                    else:
+                        asset["annotations"] = _video_annotations(row.get("boxes"), asset, model_labels)
                     if (source["sha256"], index) in known:
                         skipped += 1
                         continue
@@ -439,16 +448,40 @@ class Project:
                 self._commit(data)
         return annotation_id
 
-    def add_box(self, asset_id: str, label: str, box) -> str:
-        """Save a hand-drawn detection box from original-image (x1, y1, x2, y2) pixels."""
+    @property
+    def grounding_prompt(self) -> str:
+        return self._data.get("grounding_prompt", "car door")
+
+    def set_grounding_prompt(self, prompt: str) -> str:
+        prompt = " ".join(prompt.split()).strip(".").strip()
+        if not prompt or len(prompt) > 120:
+            raise ValueError("請輸入 1 至 120 字元的物件提示詞。")
+        with _project_lock(self.directory):
+            data = _read_manifest(self.directory)
+            if data.get("grounding_prompt") != prompt:
+                data["grounding_prompt"] = prompt
+                self._commit(data)
+        return prompt
+
+    def add_box(self, asset_id: str, label: str, box, *, suggestion=None) -> str:
+        """Save a confirmed detection box in original-image pixels."""
         with _project_lock(self.directory):
             data = _read_manifest(self.directory)
             asset = _asset(data, asset_id)
             if label not in data["labels"]:
                 raise ValueError("請先選擇已建立的類別。")
             annotation_id = uuid4().hex
-            asset["annotations"].append({"id": annotation_id, "type": "bbox", "label": label,
-                                         "source": "manual", "score": None, **_box_geometry(asset, box)})
+            record = {"id": annotation_id, "type": "bbox", "label": label,
+                      "source": "manual", "score": None, **_box_geometry(asset, box)}
+            if suggestion is not None:
+                prompt, rank, score = suggestion
+                if not isinstance(prompt, str) or not prompt.strip() or type(rank) is not int or not 1 <= rank <= 5:
+                    raise ValueError("文字候選來源無效。")
+                score = _finite(score, "候選分數")
+                if not 0 <= score <= 1:
+                    raise ValueError("候選分數無效。")
+                record.update(source="grounding_dino", score=score, suggestion={"prompt": prompt, "rank": rank})
+            asset["annotations"].append(record)
             asset["reviewed"] = False
             self._commit(data)
         return annotation_id

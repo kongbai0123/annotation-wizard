@@ -52,8 +52,8 @@ class VideoPreview:
 class VideoApproval:
     video: Path
     video_sha256: str
-    model: Path
-    model_sha256: str
+    model: Path | None
+    model_sha256: str | None
     interpreter: Path
     sample_fps: float
     confidence: float
@@ -173,6 +173,7 @@ class VideoReviewDialog:
         self.info = tk.StringVar(value="正在讀取影片和核對檔案內容…")
         self.thumb_text = tk.StringVar(value="等待預覽")
         self.model_text = tk.StringVar(value="尚未選擇模型")
+        self.keyframes = tk.BooleanVar(value=False)
         self.sample = tk.StringVar(value="2")
         self.confidence = tk.StringVar(value="0.35")
         self.status = tk.StringVar(value="請先確認影片內容，再選擇對應類別的本機模型。")
@@ -212,14 +213,19 @@ class VideoReviewDialog:
 
         settings = tk.Frame(self.window, bg=BACKGROUND)
         settings.pack(fill="x", padx=17, pady=4)
-        ttk.Button(settings, text="選擇本機 YOLO .pt", command=self._choose_model).pack(side="left", padx=(0, 8))
-        ttk.Entry(settings, textvariable=self.model_text, state="readonly").pack(side="left", expand=True, fill="x")
+        ttk.Checkbutton(settings, text="只匯入關鍵畫格", variable=self.keyframes,
+                        command=self._change_mode).pack(side="left", padx=(0, 10))
+        self.model_button = ttk.Button(settings, text="選擇本機 YOLO .pt", command=self._choose_model)
+        self.model_button.pack(side="left", padx=(0, 8))
+        self.model_entry = ttk.Entry(settings, textvariable=self.model_text, state="readonly")
+        self.model_entry.pack(side="left", expand=True, fill="x")
         numbers = tk.Frame(self.window, bg=BACKGROUND)
         numbers.pack(fill="x", padx=17, pady=(0, 4))
         self._label(numbers, "儲存畫格／秒").pack(side="left")
         ttk.Entry(numbers, textvariable=self.sample, width=7).pack(side="left", padx=(6, 18))
         self._label(numbers, "偵測信心門檻").pack(side="left")
-        ttk.Entry(numbers, textvariable=self.confidence, width=7).pack(side="left", padx=6)
+        self.conf_entry = ttk.Entry(numbers, textvariable=self.confidence, width=7)
+        self.conf_entry.pack(side="left", padx=6)
 
         self.sample.trace_add("write", self._update_confirm)
         self.confidence.trace_add("write", self._update_confirm)
@@ -262,7 +268,7 @@ class VideoReviewDialog:
                     duration = _clock(value.frames / value.fps) if value.frames else "未知"
                     self.info.set(f"{value.width} × {value.height}　{value.fps:.3g} FPS　長度 {duration}　"
                                   f"{value.stamp.size / 1024**2:,.1f} MB　SHA-256 {value.stamp.sha256[:12]}…")
-                    self.sample.set(f"{min(2, value.fps):.6g}")
+                    self.sample.set(f"{min(1 if self.keyframes.get() else 2, value.fps):.6g}")
                     self.play.state(["!disabled"] if hasattr(os, "startfile") else ["disabled"])
                     self._show(0)
             elif request == self.model_request:
@@ -312,9 +318,18 @@ class VideoReviewDialog:
         Thread(target=self._read, args=("model", self.model_request, lambda: _inspect_model(Path(chosen), self.stop)),
                daemon=True).start()
 
+    def _change_mode(self):
+        keyframes = self.keyframes.get()
+        self.model_button.state(["disabled"] if keyframes else ["!disabled"])
+        self.model_entry.configure(state="disabled" if keyframes else "readonly")
+        self.conf_entry.configure(state="disabled" if keyframes else "normal")
+        default = 1 if keyframes else 2
+        self.sample.set(f"{min(default, self.preview.fps) if self.preview else default:.6g}")
+
     def _parameters(self) -> tuple[float, float]:
         try:
-            sample, confidence = float(self.sample.get()), float(self.confidence.get())
+            sample = float(self.sample.get())
+            confidence = 0.25 if self.keyframes.get() else float(self.confidence.get())
         except ValueError as exc:
             raise ValueError("請輸入有效的畫格率與信心門檻。") from exc
         if not 0.1 <= sample <= min(self.preview.fps + 1e-6, 60):
@@ -327,11 +342,12 @@ class VideoReviewDialog:
 
     def _update_confirm(self, *_args):
         ready = False
-        if self.runtime is None:
-            self.status.set("找不到本機 Ultralytics 執行環境。請設定 ANNOTATION_WIZARD_VIDEO_PYTHON。")
-        elif self.preview is None:
+        keyframes = self.keyframes.get()
+        if self.preview is None:
             self.status.set("影片預覽與檔案核對完成後才能確認。")
-        elif self.model is None:
+        elif not keyframes and self.runtime is None:
+            self.status.set("找不到本機 Ultralytics 執行環境。請設定 ANNOTATION_WIZARD_VIDEO_PYTHON。")
+        elif not keyframes and self.model is None:
             self.status.set("請選擇要使用且可信任的 YOLO 偵測模型。")
         else:
             try:
@@ -346,11 +362,15 @@ class VideoReviewDialog:
         self.confirm_button.state(["!disabled"] if ready else ["disabled"])
 
     def confirm(self):
-        if self.preview is None or self.model is None or self.runtime is None or self.confirm_button.instate(["disabled"]):
+        keyframes = self.keyframes.get()
+        if self.preview is None or self.confirm_button.instate(["disabled"]):
             return
         try:
             sample, confidence = self._parameters()
-            for path, stamp in ((self.preview.path, self.preview.stamp), self.model):
+            files = [(self.preview.path, self.preview.stamp)]
+            if not keyframes:
+                files.append(self.model)
+            for path, stamp in files:
                 now = path.stat()
                 if (now.st_size, now.st_mtime_ns) != (stamp.size, stamp.modified_ns):
                     raise ValueError("影片或模型檔案在審查後有變更，請重新選擇。")
@@ -358,9 +378,16 @@ class VideoReviewDialog:
             self.status.set(str(exc))
             self.confirm_button.state(["disabled"])
             return
-        self.approved = VideoApproval(self.preview.path, self.preview.stamp.sha256, self.model[0],
-                                      self.model[1].sha256, self.runtime, sample, confidence)
+        self.approved = VideoApproval(self.preview.path, self.preview.stamp.sha256,
+                                      None if keyframes else self.model[0],
+                                      None if keyframes else self.model[1].sha256,
+                                      console_python() if keyframes else self.runtime, sample, confidence)
         self.close()
+
+
+def console_python() -> Path:
+    exe = Path(sys.executable)
+    return exe.with_name("python.exe") if exe.name.lower() == "pythonw.exe" else exe
 
 
 class VideoImport:
@@ -426,9 +453,12 @@ class VideoImport:
             out = directory / "result"
             approval = self.approval
             cmd = [str(approval.interpreter), str(ROOT / "video_worker.py"), "--video", str(approval.video),
-                   "--model", str(approval.model), "--out", str(out), "--sample-fps", str(approval.sample_fps),
-                   "--conf", str(approval.confidence), "--approved-video-sha256", approval.video_sha256,
-                   "--approved-model-sha256", approval.model_sha256]
+                   "--out", str(out), "--sample-fps", str(approval.sample_fps),
+                   "--conf", str(approval.confidence), "--approved-video-sha256", approval.video_sha256]
+            if approval.model is None:
+                cmd.append("--keyframes")
+            else:
+                cmd.extend(("--model", str(approval.model), "--approved-model-sha256", approval.model_sha256))
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUNBUFFERED"] = "1"

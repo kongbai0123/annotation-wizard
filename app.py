@@ -17,6 +17,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from project import Project
+from grounding import GroundingEngine
 from mask_cleanup import clean_mask
 from segmentation import SegmentationEngine
 from video_dialog import VIDEO_TYPES, VideoImport, VideoReviewDialog
@@ -92,6 +93,10 @@ class WizardApp:
         self.expected_bbox: list | None = None
         self.prompt_history = []
         self.box: tuple[float, float, float, float] | None = None
+        self.box_suggestion = None
+        self.resize_draft = False
+        self.grounding_choices = []
+        self.grounding = GroundingEngine()
         self.positive: list[tuple] = []
         self.negative: list[tuple] = []
         self.revision = 0
@@ -112,6 +117,8 @@ class WizardApp:
             "config.json", "model.safetensors", "preprocessor_config.json", "processor_config.json"
         ))
         self.class_name = tk.StringVar()
+        self.grounding_prompt = tk.StringVar()
+        self.grounding_prompt.trace_add("write", self._grounding_prompt_changed)
         self.method = tk.StringVar(value="本機 SAM 2.1" if self.sam_available else "GrabCut")
         self.tool = tk.StringVar(value="box")
         self.mode = tk.StringVar(value=BOX_MODE)
@@ -295,6 +302,17 @@ class WizardApp:
         self.class_picker.bind("<<ComboboxSelected>>", self._settings_changed)
         self.new_label_button = ttk.Button(classes, text="新增", command=self.add_label, padding=(8, 3))
         self.new_label_button.pack(side="left", padx=(5, 0))
+        grounding = self.grounding_options = tk.Frame(parent, bg=PANEL)
+        self._label(grounding, "文字候選框", size=9, fg=MUTED).pack(anchor="w", padx=11)
+        query = tk.Frame(grounding, bg=PANEL)
+        query.pack(fill="x", padx=11, pady=(1, 3))
+        self.grounding_entry = ttk.Entry(query, textvariable=self.grounding_prompt, width=14)
+        self.grounding_entry.pack(side="left", fill="x", expand=True)
+        self.grounding_button = ttk.Button(query, text="找框", command=self.find_text_boxes)
+        self.grounding_button.pack(side="right", padx=(4, 0))
+        self.grounding_picker = ttk.Combobox(grounding, state="disabled")
+        self.grounding_picker.pack(fill="x", padx=11, pady=(0, 4))
+        self.grounding_picker.bind("<<ComboboxSelected>>", self._pick_text_box)
         mask_options = self.mask_options = tk.Frame(parent, bg=PANEL)
         engines = tk.Frame(mask_options, bg=PANEL)
         engines.pack(fill="x", padx=11, pady=(0, 4))
@@ -392,12 +410,14 @@ class WizardApp:
     def _show_mode_controls(self):
         if self._box_mode():
             self.mask_options.pack_forget()
+            self.grounding_options.pack(fill="x", before=self.generate_button)
             self.repair_toolbar.pack_forget()
             for tool in self.prompt_tools[1:]:
                 tool.pack_forget()
             self.accept_button.pack_forget()
             self.generate_button.configure(command=self.save_box)
         else:
+            self.grounding_options.pack_forget()
             self.mask_options.pack(fill="x", before=self.generate_button)
             self.repair_toolbar.pack(fill="x", before=self.canvas)
             for tool in self.prompt_tools[1:]:
@@ -428,6 +448,8 @@ class WizardApp:
 
     def _clear_box_draft(self):
         self.box = self.drag_box = None
+        self.box_suggestion = None
+        self.resize_draft = False
         self.edit_box_id = self.expected_bbox = None
         self.prompt_history.clear()
 
@@ -473,6 +495,7 @@ class WizardApp:
 
     def _set_project(self, project, directory):
         self.project, self.directory = project, directory.resolve()
+        self.grounding_prompt.set(project.grounding_prompt)
         self.project_title.configure(text=self.directory.name)
         self.class_name.set(project.labels[0] if project.labels else "")
         self.class_picker.configure(values=project.labels)
@@ -552,7 +575,8 @@ class WizardApp:
                 read, total = latest.get("frames_read", 0), latest.get("total_frames", 0)
                 sampled = latest.get("frames_sampled", 0)
                 counted = f"{read:,} / {total:,}" if total else f"{read:,}"
-                self._message(f"正在偵測與追蹤 {counted} 畫格 · 已擷取 {sampled:,} 張")
+                action = "擷取" if latest.get("stage") == "sampling" else "偵測與追蹤"
+                self._message(f"正在{action} {counted} 畫格 · 已擷取 {sampled:,} 張")
         self.root.after(120, lambda: self._poll_video(job))
 
     def cancel_video(self):
@@ -606,6 +630,7 @@ class WizardApp:
 
     def _select_asset(self, asset):
         self.asset, self.image = None, None
+        self._grounding_prompt_changed()
         self._clear_preview()
         self.selected_annotation = None
         self._clear_box_draft()
@@ -678,17 +703,18 @@ class WizardApp:
         self._schedule_canvas()
 
     def _remember_prompts(self):
-        self.prompt_history.append((self.box, self.positive.copy(), self.negative.copy()))
+        self.prompt_history.append((self.box, self.positive.copy(), self.negative.copy(), self.box_suggestion))
 
     def undo_prompt(self):
         if self.prompt_history and not self._repairing_saved():
-            self.box, self.positive, self.negative = self.prompt_history.pop()
+            self.box, self.positive, self.negative, self.box_suggestion = self.prompt_history.pop()
             self._prompt_changed()
 
     def clear_prompts(self):
         if not self._repairing_saved() and (self.box or self.positive or self.negative):
             self._remember_prompts()
             self.box = None
+            self.box_suggestion = None
             self.positive, self.negative = [], []
             self._prompt_changed()
 
@@ -715,7 +741,16 @@ class WizardApp:
         if self._repairing_saved():
             return
         if kind == "box":
+            self.resize_draft = False
             self.drag_box = (point, point)
+            if self._box_mode() and self.box:
+                x0, y0, x1, y1 = self.box
+                corners = (((x0, y0), (x1, y1)), ((x0, y1), (x1, y0)),
+                           ((x1, y0), (x0, y1)), ((x1, y1), (x0, y0)))
+                corner, anchor = min(corners, key=lambda pair: max(abs(a - b) for a, b in zip(pair[0], point)))
+                if max(abs(a - b) for a, b in zip(corner, point)) * self.scale <= 9:
+                    self.resize_draft = True
+                    self.drag_box = (anchor, corner)
             self._schedule_canvas()
             return
         if len(self.positive) + len(self.negative) >= 64:
@@ -755,6 +790,8 @@ class WizardApp:
         self.drag_box = None
         if abs(x - other_x) >= 2 and abs(y - other_y) >= 2:
             self._remember_prompts()
+            if not self.resize_draft:
+                self.box_suggestion = None
             self.box = (min(x, other_x), min(y, other_y), max(x, other_x), max(y, other_y))
             self._prompt_changed()
         else:
@@ -950,6 +987,10 @@ class WizardApp:
             x0, y0, x1, y1 = box
             canvas.create_rectangle(ox+x0*scale, oy+y0*scale, ox+x1*scale, oy+y1*scale,
                                     outline=BOX_COLOR, width=2, dash=(6, 4))
+            if self._box_mode() and not self.drag_box:
+                for x, y in ((x0, y0), (x0, y1), (x1, y0), (x1, y1)):
+                    px, py = ox + x * scale, oy + y * scale
+                    canvas.create_rectangle(px-3, py-3, px+3, py+3, fill=BOX_COLOR, outline=WORKSPACE)
         for points, color, marker in ((self.positive, POSITIVE, "+"), (self.negative, NEGATIVE, "−")):
             for point_x, point_y in points:
                 x, y = ox+point_x*scale, oy+point_y*scale
@@ -1051,7 +1092,8 @@ class WizardApp:
                 self.selected_annotation = self.project.replace_box(self.asset["id"], self.edit_box_id, self.box,
                                                                     expected_bbox=self.expected_bbox)
             else:
-                self.selected_annotation = self.project.add_box(self.asset["id"], label, self.box)
+                self.selected_annotation = self.project.add_box(self.asset["id"], label, self.box,
+                                                                suggestion=self.box_suggestion)
         except Exception as exc:
             self._error("無法儲存偵測框", exc)
             return
@@ -1059,6 +1101,52 @@ class WizardApp:
         self._reload_asset_record()
         self._prompt_changed()
         self._message(f"已{'更新' if editing else '儲存'}「{label}」偵測框。")
+
+    def _grounding_prompt_changed(self, *_args):
+        self.grounding_choices = []
+        self.grounding_picker.set("")
+        self.grounding_picker.configure(values=(), state="disabled")
+
+    def find_text_boxes(self):
+        if not self._box_mode() or self.task is not None or self.asset is None:
+            return
+        project, image = self.project, self.image
+        try:
+            prompt = project.set_grounding_prompt(self.grounding_prompt.get())
+        except Exception as exc:
+            self._error("無法設定提示詞", exc)
+            return
+        self.grounding_prompt.set(prompt)
+        self._message("正在以本機文字模型尋找候選框…")
+
+        def apply(choices):
+            if self.project is not project or self.image is not image or not self._box_mode():
+                return
+            self.grounding_choices = choices
+            self.grounding_picker.configure(values=[f"候選 {rank}　分數 {score:.2f}"
+                                                     for rank, (_, score) in enumerate(choices, 1)])
+            self._message(f"找到 {len(choices)} 個候選。選擇預覽，再微調或儲存。" if choices else "沒有可用的候選框。")
+
+        self._start_task("grounding", lambda: self.grounding.propose(image, prompt),
+                         apply, "文字候選框無法使用")
+
+    def _pick_text_box(self, _event=None):
+        index = self.grounding_picker.current()
+        if not self._box_mode() or self.task is not None or not 0 <= index < len(self.grounding_choices):
+            return
+        previous = self.box_suggestion
+        unchanged = (previous and previous[0] == self.grounding_prompt.get()
+                     and previous[1] <= len(self.grounding_choices)
+                     and self.box == self.grounding_choices[previous[1] - 1][0])
+        if self.box is not None and not unchanged and not messagebox.askyesno(
+                "更換框選草稿", "用選取的候選框取代目前未儲存的框？", parent=self.root):
+            self.grounding_picker.set("")
+            return
+        self._clear_box_draft()
+        self.box, score = self.grounding_choices[index]
+        self.box_suggestion = (self.grounding_prompt.get(), index + 1, score)
+        self._prompt_changed()
+        self._message("可拖曳框的四角。選擇類別後按「儲存框」。")
 
     def generate(self):
         if self._box_mode() or self.task is not None or self.asset is None or self.image is None or self._repairing_saved():
@@ -1261,6 +1349,9 @@ class WizardApp:
         enable(self.open_button, not disk_busy)
         enable(self.import_button, has_project and not busy)
         enable(self.video_button, has_project and not busy)
+        enable(self.grounding_button, has_asset and box_mode and not busy and not editing_box)
+        self.grounding_entry.configure(state="normal" if has_project and not busy else "disabled")
+        self.grounding_picker.configure(state="readonly" if self.grounding_choices and not busy else "disabled")
         export_possible = has_project and not busy and any(row.get("reviewed") or (row["annotations"] and not row.get("video"))
                                                             for row in self.project.assets)
         enable(self.export_button, export_possible)
