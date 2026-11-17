@@ -129,8 +129,10 @@ def run_fill(plan, model_dir, output):
             gap = right["index"] - left["index"]
             emit("progress", stage="sam_fill", frames_read=index, total_frames=len(plan["segments"]),
                  frames_sampled=len(result["frames"]))
-            offsets = [i for i in output_offsets(gap, source["fps"], plan["sample_fps"])
-                       if left["index"] + i not in existing]
+            refresh = segment.get("refresh", {})
+            offsets = {i for i in output_offsets(gap, source["fps"], plan["sample_fps"])
+                       if left["index"] + i not in existing}
+            offsets.update(int(i) - left["index"] for i in refresh)
             if not offsets and not plan["preview"]:
                 continue
             images = decode_segment(cv2, capture, left["index"], right["index"], (plan["width"], plan["height"]))
@@ -140,10 +142,16 @@ def run_fill(plan, model_dir, output):
                                          for track, box in left["boxes"].items() if gap in paths[track]]
                 break
             saved = 0
-            for offset, boxes in fill_segment(model, images, segment, offsets):
+            for offset, boxes in fill_segment(model, images, segment, sorted(offsets)):
                 if len(result["frames"]) >= MAX_SAMPLED_FRAMES:
                     raise ValueError("補框輸出超過 20,000 張，請降低儲存畫格率。")
                 frame = left["index"] + offset
+                time_ms = left["time_ms"] + (right["time_ms"] - left["time_ms"]) * offset / gap
+                if str(frame) in refresh:
+                    result["frames"].append({"frame_index": frame, "time_ms": time_ms, "boxes": boxes,
+                                             "segment": index})
+                    saved += 1
+                    continue
                 name = f"frames/{frame:09d}.png"
                 pixels = cv2.cvtColor(images[offset], cv2.COLOR_RGB2BGR)
                 ok, encoded = cv2.imencode(".png", pixels, [cv2.IMWRITE_PNG_COMPRESSION, 2])
@@ -154,7 +162,6 @@ def run_fill(plan, model_dir, output):
                 if staged_bytes > MAX_FRAME_BYTES:
                     raise ValueError("補框暫存超過 8 GiB，請降低儲存畫格率。")
                 (output / name).write_bytes(contents)
-                time_ms = left["time_ms"] + (right["time_ms"] - left["time_ms"]) * offset / gap
                 result["frames"].append({"frame_index": frame, "time_ms": time_ms, "file": name,
                                          "sha256": hashlib.sha256(contents).hexdigest(), "boxes": boxes,
                                          "segment": index})

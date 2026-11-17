@@ -197,6 +197,52 @@ class VideoImportTests(unittest.TestCase):
         self.assertEqual(self.project.labels, ["保留原類別"])
         self.assertEqual(self.project.assets, [])
 
+    def test_refill_updates_only_untouched_pending_neighbors_and_persists(self):
+        self.manifest.update(mode="keyframes", model=None)
+        for row in self.manifest["frames"]:
+            row["boxes"] = []
+        self.write_manifest()
+        self.import_result(model_sha=None)
+        left, right = (a["id"] for a in self.project.assets)
+        label = self.project.add_label("open")
+        for aid in (left, right):
+            ident = self.project.add_box(aid, label, (5, 5, 25, 30))
+            self.project.set_video_track(aid, ident, "door")
+            self.project.set_reviewed(aid, True)
+
+        def frame(i, segment=0, *, replacement=False):
+            row = {"frame_index": i, "time_ms": i * 40, "segment": segment,
+                   "boxes": [{"track": "door", "label": label,
+                              "xyxy": [7 if replacement else 5, 5, 25, 30], "needs_label_review": False}]}
+            if not replacement:
+                path = self.result.parent / f"frames/{i:09d}.png"
+                Image.new("RGB", (80, 50), "black").save(path)
+                row.update(file=f"frames/{i:09d}.png", sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            return row
+
+        self.manifest = {"source_sha256": VIDEO_SHA256, "missed": 0, "frames": [frame(i) for i in range(1, 5)]}
+        self.write_manifest()
+        self.project.import_video_fill(self.result, left, self.project.video_fill_plan(left))
+        self.project.set_reviewed(self.project.assets[4]["id"], True)
+        center = self.project.assets[2]
+        self.project.replace_box(center["id"], center["annotations"][0]["id"], (6, 5, 25, 30))
+        before = self.project.video_fill_plan(right, preview=True)["segments"][0]["left"]
+        self.assertEqual(before["asset_id"], left)
+        self.project.set_reviewed(center["id"], True)
+        plan = self.project.video_fill_plan(center["id"])
+        self.assertEqual([list(s["refresh"]) for s in plan["segments"]], [["1"], ["3"]])
+        files = [self.project.image_path(a["id"]).read_bytes() for a in self.project.assets]
+        ids = [a["id"] for a in self.project.assets]
+        self.manifest["frames"] = [frame(1, replacement=True), frame(3, 1, replacement=True)]
+        self.write_manifest()
+        stats = self.project.import_video_fill(self.result, center["id"], plan)
+        self.assertEqual((stats["imported_frames"], stats["updated_frames"]), (0, 2))
+        restored = Project.open(self.project.directory)
+        self.assertEqual([a["id"] for a in restored.assets], ids)
+        self.assertEqual([restored.image_path(a["id"]).read_bytes() for a in restored.assets], files)
+        self.assertEqual([a["annotations"][0]["bbox"][0] for a in restored.assets], [5, 7, 6, 7, 5, 5])
+        self.assertEqual(restored.video_fill_plan(center["id"])["segments"], [])
+
     def test_review_gates_export_for_detections_and_empty_frames(self):
         self.assertEqual(self.import_result(), {"imported_frames": 2, "added_boxes": 1, "skipped_frames": 0})
         project = Project.open(self.project.directory)

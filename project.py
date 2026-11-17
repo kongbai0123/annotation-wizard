@@ -421,8 +421,9 @@ class Project:
             originals = video_frames(data["assets"], selected)
             existing = plan["existing"]
             used = set(existing)
+            by_id = {a["id"]: a for a in originals}
             pending = {}
-            count = 0
+            count = refreshed = 0
             previous = -1
             with tempfile.TemporaryDirectory(prefix=".sam-fill-", dir=self.directory) as staging:
                 staged = []
@@ -433,21 +434,31 @@ class Project:
                     previous = idx
                     bounds = plan["segments"][segment]
                     first, last = bounds["left"], bounds["right"]
+                    refresh = bounds["refresh"].get(str(idx))
                     stamp = _finite(row["time_ms"], "補框時間戳記")
-                    if (not first["index"] < idx < last["index"] or idx in used
+                    if (not first["index"] < idx < last["index"] or (idx in used) != bool(refresh)
                             or not first["time_ms"] <= stamp <= last["time_ms"]):
                         raise ValueError("補框影格不在對應區間內。")
                     filename = f"frames/{idx:09d}.png"
-                    digest = row["sha256"]
-                    if row["file"] != filename or not _SHA256.fullmatch(digest):
-                        raise ValueError("補框影格檔案資料無效。")
-                    identifier = uuid4().hex
-                    asset = {"id": identifier, "name": f"{Path(plan['video']['path']).stem} · {stamp / 1000:.3f}s",
-                             "width": width, "height": height, "source_sha256": digest, "image_sha256": digest,
-                             "reviewed": False, "annotations": [],
-                             "video": {**plan["video"], "frame_index": idx, "time_ms": stamp,
-                                       "sample_fps": plan["sample_fps"], "sam_fill": True,
-                                       "anchors": [first["asset_id"], last["asset_id"]]}}
+                    if refresh:
+                        asset = by_id[refresh["asset_id"]]
+                        identifier = asset["id"]
+                        if _digest(self._image_directory() / f"{identifier}.png") != asset["image_sha256"]:
+                            raise ValueError("既有補框影格已變更。")
+                    else:
+                        digest = row["sha256"]
+                        if row["file"] != filename or not _SHA256.fullmatch(digest):
+                            raise ValueError("補框影格檔案資料無效。")
+                        identifier = uuid4().hex
+                        asset = {"id": identifier, "name": f"{Path(plan['video']['path']).stem} · {stamp / 1000:.3f}s",
+                                 "width": width, "height": height, "source_sha256": digest, "image_sha256": digest,
+                                 "reviewed": False, "annotations": [],
+                                 "video": {**plan["video"], "frame_index": idx, "time_ms": stamp,
+                                           "sample_fps": plan["sample_fps"], "sam_fill": True}}
+                    prior_ids = {b["video_track"]: b["id"] for b in asset["annotations"]}
+                    asset["annotations"] = []
+                    asset["video"].update(anchors=[first["asset_id"], last["asset_id"]],
+                                          sam_fill_signature=bounds["signature"])
                     tracks = set()
                     for box in row["boxes"]:
                         track, label = box["track"], box["label"]
@@ -457,20 +468,27 @@ class Project:
                         if label not in (a, b) or label not in data["labels"] or box["needs_label_review"] is not (a != b):
                             raise ValueError("補框物件類別與關鍵框不符。")
                         tracks.add(track)
-                        asset["annotations"].append({"id": uuid4().hex, "type": "bbox", "label": label,
+                        asset["annotations"].append({"id": prior_ids.get(track) or uuid4().hex, "type": "bbox", "label": label,
                                                      "source": "sam_fill", "score": None, "video_track": track,
                                                      "needs_label_review": a != b,
                                                      **_box_geometry(asset, box["xyxy"])})
                     if tracks != first["boxes"].keys():
                         raise ValueError("補框結果缺少對應物件。")
-                    staged.append(_stage_frame(path.parent, staging, filename, identifier, digest, (width, height)))
                     count += len(tracks)
-                    following = originals[bisect_right(existing, idx)]["id"]
-                    pending.setdefault(following, []).append(asset)
+                    if refresh:
+                        refreshed += 1
+                    else:
+                        staged.append(_stage_frame(path.parent, staging, filename, identifier, digest, (width, height)))
+                        following = originals[bisect_right(existing, idx)]["id"]
+                        pending.setdefault(following, []).append(asset)
                 data["assets"] = [a for original in data["assets"]
                                   for a in (*pending.get(original["id"], ()), original)]
-                self._commit_images(staged, data)
-            return {"imported_frames": len(staged), "added_boxes": count, "skipped_frames": result["missed"],
+                if refreshed and not staged:
+                    self._commit(data)
+                else:
+                    self._commit_images(staged, data)
+            return {"imported_frames": len(staged), "updated_frames": refreshed, "added_boxes": count,
+                    "skipped_frames": result["missed"],
                     "skipped_intervals": plan["skipped"]}
 
     def set_video_track(self, asset_id, annotation_id, name):
@@ -482,6 +500,8 @@ class Project:
             asset = _asset(data, asset_id)
             record = self._video_box(asset, annotation_id)
             self._check_video_track(asset, name, annotation_id)
+            if asset["video"].get("sam_fill") and record.get("video_track") != name:
+                asset["video"]["sam_fill_touched"] = True
             record["video_track"] = name
             self._commit(data)
 
@@ -506,6 +526,8 @@ class Project:
                 raise ValueError("請先選擇已建立的類別。")
             record = self._video_box(asset, annotation_id)
             record.update(label=label, needs_label_review=False)
+            if asset["video"].get("sam_fill"):
+                asset["video"]["sam_fill_touched"] = True
             asset["reviewed"] = False
             self._commit(data)
 
@@ -591,7 +613,7 @@ class Project:
                 self._commit(data)
         return prompt
 
-    def add_box(self, asset_id: str, label: str, box, *, suggestion=None, propagated=None) -> str:
+    def add_box(self, asset_id: str, label: str, box, *, suggestion=None, propagated=None, original_box=None) -> str:
         """Save a confirmed detection box in original-image pixels."""
         with _project_lock(self.directory):
             data = _read_manifest(self.directory)
@@ -618,6 +640,13 @@ class Project:
                     raise ValueError("SAM 傳播的上一關鍵框在使用期間已變更。")
                 self._check_video_track(asset, track)
                 record.update(source="sam_forward", video_track=track, from_asset=previous["asset_id"])
+            if original_box is not None:
+                if suggestion is None and propagated is None:
+                    raise ValueError("原始候選框缺少來源。")
+                original = list(map(float, original_box))
+                geometry = _box_geometry(asset, original)
+                record.setdefault("suggestion", {}).update(
+                    original_xyxy=original, adjusted=geometry["bbox"] != record["bbox"])
             asset["annotations"].append(record)
             asset["reviewed"] = False
             self._commit(data)
@@ -637,6 +666,9 @@ class Project:
                 self._data = data
             else:
                 annotation.update(geometry)
+                candidate = annotation.get("suggestion")
+                if candidate and "original_xyxy" in candidate:
+                    candidate["adjusted"] = _box_geometry(asset, candidate["original_xyxy"])["bbox"] != geometry["bbox"]
                 asset["reviewed"] = False
                 if annotation.get("source") == "sam_fill":
                     asset["video"]["keyframe"] = True

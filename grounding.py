@@ -2,7 +2,6 @@
 
 from copy import deepcopy
 from hashlib import file_digest
-import json
 import os
 from pathlib import Path
 
@@ -18,6 +17,14 @@ FILES = {
     "tokenizer_config.json": "03070b03f452696da3d89489fa8a4e53730ab74ed2ae466d53923ab5376ce7b5",
     "vocab.txt": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3",
 }
+HEALTH_EXAMPLES = (
+    {"file": "00010bf498b64bab.jpg", "prompt": "car", "xyxy": [592.64, 287.038656, 713.6, 386.34912],
+     "sha256": "2fbef90e6bae5a3dcba323ca103716df2022a32ee37cd0b2a7daf8054975d99e"},
+    {"file": "000851174d48d3d9.jpg", "prompt": "person", "xyxy": [148.48, 234.50122, 270.72, 681.078038],
+     "sha256": "4ec4d724a8e9bb0addc4209c77dec1e5e837ff7c5d3d3d8349a0424bae497a8a"},
+    {"file": "00a601c5da2603d2.jpg", "prompt": "person", "xyxy": [209.28, 369.28, 392.319744, 960.64],
+     "sha256": "b2120616c48e83e0b62945ded7099216428db5443ec2431d35542aaacdb0c403"},
+)
 
 
 def digest(path):
@@ -97,16 +104,11 @@ class GroundingEngine:
     def __init__(self, directory=None):
         self.directory = Path(directory or os.environ.get("ANNOTATION_WIZARD_DINO_DIR", MODEL_DIR)).resolve()
         self.model = None
+        self.load_error = None
 
     def _check_examples(self, processor, model, device):
         folder = self.directory / "health"
-        manifest = folder / "manifest.json"
-        if not manifest.is_file():
-            raise ValueError(f"缺少 DINO 健全性測試圖片：{manifest}")
-        examples = json.loads(manifest.read_text(encoding="utf-8"))
-        if {row["prompt"] for row in examples} != {"person", "car"}:
-            raise ValueError("DINO 健全性測試必須包含 person 和 car。")
-        for row in examples:
+        for row in HEALTH_EXAMPLES:
             path = folder / row["file"]
             if path.resolve().parent != folder or digest(path) != row["sha256"]:
                 raise ValueError("DINO 健全性測試圖片的路徑或雜湊不符。")
@@ -116,11 +118,21 @@ class GroundingEngine:
                        for box, _ in detect(processor, model, device, image, row["prompt"])):
                 raise RuntimeError(f"DINO 健全性測試未找到 {row['prompt']}：{path.name}")
 
-    def propose(self, image, prompt):
-        if self.model is None:
+    def ensure_loaded(self):
+        if self.model is not None:
+            return
+        if self.load_error is not None:
+            raise RuntimeError(self.load_error)
+        try:
             import torch
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
             processor, model = load_model(self.directory, device)
             self._check_examples(processor, model, device)
-            self.processor, self.model, self.device = processor, model, device
+        except Exception as exc:
+            self.load_error = f"文字候選框已停用。請準備本機權重與對照圖後重新啟動。\n{exc}"
+            raise RuntimeError(self.load_error) from exc
+        self.processor, self.model, self.device = processor, model, device
+
+    def propose(self, image, prompt):
+        self.ensure_loaded()
         return detect(self.processor, self.model, self.device, image, prompt)

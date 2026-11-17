@@ -1,4 +1,4 @@
-param([switch]$CpuOnly, [string]$ModelSource)
+param([switch]$CpuOnly, [string]$ModelSource, [switch]$WithDino, [string]$DinoSource)
 
 $ErrorActionPreference = 'Stop'
 $projectPython = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
@@ -19,5 +19,12 @@ $modelArgs = @((Join-Path $PSScriptRoot 'prepare_model.py'))
 if ($ModelSource) { $modelArgs += @('--from-dir', $ModelSource) }
 & $projectPython @modelArgs
 if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the SAM 2.1 model.' }
+
+if ($WithDino -or $DinoSource) {
+    $dinoArgs = @((Join-Path $PSScriptRoot 'prepare_grounding.py'))
+    if ($DinoSource) { $dinoArgs += @('--from-dir', $DinoSource) }
+    & $projectPython @dinoArgs
+    if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the MM Grounding DINO model.' }
+}
 
 & (Join-Path $PSScriptRoot 'build-app.ps1')
