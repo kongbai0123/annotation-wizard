@@ -1,0 +1,11 @@
+.venv/
+.video-deps/
+__pycache__/
+*.pyc
+models/
+logs/
+projects/
+AnnotationWizard.exe
+/training/
+/temp1/
+/Ultralytics/
