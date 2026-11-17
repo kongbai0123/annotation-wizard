@@ -11,6 +11,7 @@ import numpy as np
 from PIL import Image
 
 from project import Project
+from fill_worker import fill_segment, output_offsets
 from video_worker import frame_annotations
 
 
@@ -27,6 +28,25 @@ class VideoCandidateTests(unittest.TestCase):
         candidates = frame_annotations(boxes, {0: "open", 1: "close"}, tracks, 40, 30, 0.25)
         self.assertEqual([(box["label"], box["track_id"], box["bbox"]) for box in candidates],
                          [("close", 21, [8, 6, 4, 4]), ("open", None, [13, 7, 7, 9])])
+
+    def test_bidirectional_offsets_label_transition_and_one_sided_fallback(self):
+        from unittest.mock import Mock
+
+        model = Mock()
+        model.propagate.side_effect = [
+            {"door": {1: [4, 4, 14, 14], 2: [8, 8, 18, 18]}},
+            {"door": {2: [10, 10, 22, 22]}},
+        ]
+        segment = {"left": {"boxes": {"door": {"label": "close"}}},
+                   "right": {"boxes": {"door": {"label": "open"}}}}
+        images = list(range(4))
+        results = list(fill_segment(model, images, segment, [1, 2]))
+        self.assertEqual(model.propagate.call_args_list[1].args[0], images[::-1])
+        self.assertEqual(results, [(1, [{"track": "door", "xyxy": [6, 6, 16.666666666666668, 16.666666666666668],
+                                         "label": "close", "needs_label_review": True}]),
+                                   (2, [{"track": "door", "xyxy": [8, 8, 18, 18],
+                                         "label": "open", "needs_label_review": True}])])
+        self.assertEqual(output_offsets(30, 30, 10), list(range(3, 30, 3)))
 
 
 class VideoImportTests(unittest.TestCase):
@@ -99,6 +119,63 @@ class VideoImportTests(unittest.TestCase):
         self.assertEqual([a["video"]["frame_index"] for a in restored.assets], [0, 5])
         self.assertTrue(all(a["video"]["keyframe"] and not a["reviewed"] and not a["annotations"]
                             for a in restored.assets))
+
+    def test_fill_requires_same_reviewed_track_and_checks_current_anchors(self):
+        self.manifest.update(mode="keyframes", model=None)
+        for row in self.manifest["frames"]:
+            row["boxes"] = []
+        self.write_manifest()
+        self.import_result(model_sha=None)
+        left, right = (a["id"] for a in self.project.assets)
+        begin = self.project.add_label("close")
+        end = self.project.add_label("open")
+        first_box = self.project.add_box(left, begin, (2, 2, 21, 22))
+        last_box = self.project.add_box(right, end, (8, 2, 27, 22))
+        for asset_id, box_id, label in ((left, first_box, "door"), (right, last_box, "different")):
+            self.project.set_video_track(asset_id, box_id, label)
+            self.project.set_reviewed(asset_id, True)
+        self.assertEqual(self.project.video_fill_plan(left)["skipped"], 1)
+        self.project.set_video_track(right, last_box, "door")
+        plan = self.project.video_fill_plan(left)
+        self.assertEqual(len(plan["segments"]), 1)
+        previous = self.project.video_fill_plan(right, preview=True)["segments"][0]["left"]
+        self.project.toggle_video_cut(right)
+        self.assertEqual(self.project.video_fill_plan(left)["segments"], [])
+        with self.assertRaisesRegex(ValueError, "在使用期間已變更"):
+            self.project.add_box(right, end, (3, 3, 23, 23), propagated=("door", previous))
+        self.project.toggle_video_cut(right)
+
+        image = self.result.parent / "frames/000000002.png"
+        Image.new("RGB", (80, 50), "black").save(image)
+        self.manifest = {"source_sha256": VIDEO_SHA256, "missed": 0, "frames": [
+            {"frame_index": 2, "time_ms": 80, "segment": 0, "file": "frames/000000002.png",
+             "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
+             "boxes": [{"track": "door", "label": "close", "xyxy": [4, 2, 23, 22], "needs_label_review": True}]},
+        ]}
+        self.write_manifest()
+        result = self.project.import_video_fill(self.result, left, plan)
+        self.assertEqual(result["added_boxes"], 1)
+        self.assertEqual([a["video"]["frame_index"] for a in self.project.assets], [0, 2, 5])
+        filled = self.project.assets[1]
+        annotation = filled["annotations"][0]
+        self.assertTrue(annotation["needs_label_review"])
+        with self.assertRaises(ValueError):
+            self.project.set_reviewed(filled["id"], True)
+        blocked = self.root / "blocked"
+        self.project.export_yolo(blocked, include_pending_fill=True)
+        self.assertFalse((blocked / "training-only").exists())
+        self.project.set_video_class(filled["id"], annotation["id"], "open")
+        standard = self.root / "standard"
+        training = self.root / "training"
+        self.project.export_yolo(standard)
+        self.project.export_yolo(training, include_pending_fill=True)
+        self.assertFalse((standard / "images" / f"{filled['id']}.png").exists())
+        self.assertTrue((training / "training-only" / "images" / f"{filled['id']}.png").is_file())
+        self.assertTrue((training / "training-only" / "provenance.json").is_file())
+        self.project.set_reviewed(filled["id"], True)
+        with self.assertRaises(ValueError):
+            self.project.import_video_fill(self.result, left, plan)
+        self.assertEqual(len(self.project.assets), 3)
 
     def test_staging_rolls_back_if_later_frame_is_tampered_or_escapes_directory(self):
         self.project.add_label("保留原類別")

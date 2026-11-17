@@ -21,6 +21,7 @@ from grounding import GroundingEngine
 from mask_cleanup import clean_mask
 from segmentation import SegmentationEngine
 from video_dialog import VIDEO_TYPES, VideoImport, VideoReviewDialog
+from video_fill import VideoFill
 
 
 ROOT = Path(__file__).resolve().parent
@@ -94,8 +95,11 @@ class WizardApp:
         self.prompt_history = []
         self.box: tuple[float, float, float, float] | None = None
         self.box_suggestion = None
+        self.sam_origin = None
         self.resize_draft = False
         self.grounding_choices = []
+        self.sam_choices = []
+        self.sam_previous = None
         self.grounding = GroundingEngine()
         self.positive: list[tuple] = []
         self.negative: list[tuple] = []
@@ -113,6 +117,7 @@ class WizardApp:
         self.alive = True
         self.closing = False
         self.engine = SegmentationEngine(model_dir)
+        self.sam_dir = model_dir.resolve()
         self.sam_available = all((model_dir / filename).is_file() for filename in (
             "config.json", "model.safetensors", "preprocessor_config.json", "processor_config.json"
         ))
@@ -125,6 +130,7 @@ class WizardApp:
         self.current_mode = BOX_MODE
         self.show_masks = tk.BooleanVar(value=True)
         self.show_raw = tk.BooleanVar(value=False)
+        self.only_fill_reviews = tk.BooleanVar(value=False)
         self.cleanup = tk.StringVar(value="平衡")
         self._theme()
         self._layout()
@@ -221,7 +227,11 @@ class WizardApp:
         self.import_button = self._button(parent, "匯入圖片", self.import_images)
         self.import_button.pack(fill="x", padx=11, pady=(0, 5))
         self.video_button = self._button(parent, "影片自動標註", self.import_video)
-        self.video_button.pack(fill="x", padx=11, pady=(0, 8))
+        self.video_button.pack(fill="x", padx=11, pady=(0, 5))
+        self.fill_button = self._button(parent, "SAM 2.1 雙向補框", self.fill_video)
+        self.fill_button.pack(fill="x", padx=11, pady=(0, 4))
+        ttk.Checkbutton(parent, text="補框待審", variable=self.only_fill_reviews,
+                        command=self._refresh_asset_list).pack(anchor="w", padx=11, pady=(0, 5))
         frame = tk.Frame(parent, bg=PANEL)
         frame.pack(fill="both", expand=True, padx=(6, 3))
         self.asset_tree = ttk.Treeview(frame, columns=("name", "count"), show="headings", selectmode="browse")
@@ -313,6 +323,12 @@ class WizardApp:
         self.grounding_picker = ttk.Combobox(grounding, state="disabled")
         self.grounding_picker.pack(fill="x", padx=11, pady=(0, 4))
         self.grounding_picker.bind("<<ComboboxSelected>>", self._pick_text_box)
+        sam = self.sam_options = tk.Frame(grounding, bg=PANEL)
+        self.sam_picker = ttk.Combobox(sam, state="disabled", width=12)
+        self.sam_picker.pack(side="left", fill="x", expand=True)
+        self.sam_picker.bind("<<ComboboxSelected>>", self._pick_sam_box)
+        self.sam_hint = ttk.Button(sam, text="找上一框", command=lambda: self.preview_sam())
+        self.sam_hint.pack(side="right", padx=(4, 0))
         mask_options = self.mask_options = tk.Frame(parent, bg=PANEL)
         engines = tk.Frame(mask_options, bg=PANEL)
         engines.pack(fill="x", padx=11, pady=(0, 4))
@@ -373,6 +389,13 @@ class WizardApp:
         scroll.pack(side="right", fill="y")
         self.annotation_tree.pack(fill="both", expand=True)
         self.annotation_tree.bind("<<TreeviewSelect>>", self._annotation_selected)
+        self.video_tools = tk.Frame(parent, bg=PANEL)
+        self.track_button = ttk.Button(self.video_tools, text="指定物件", command=self.assign_track)
+        self.track_button.pack(side="left")
+        self.cut_button = ttk.Button(self.video_tools, text="換鏡", command=self.mark_cut)
+        self.cut_button.pack(side="left", padx=4)
+        self.confirm_class_button = ttk.Button(self.video_tools, text="確認類別", command=self.confirm_video_class)
+        self.confirm_class_button.pack(side="left")
         self._show_mode_controls()
 
     def _message(self, text, error=False):
@@ -449,6 +472,7 @@ class WizardApp:
     def _clear_box_draft(self):
         self.box = self.drag_box = None
         self.box_suggestion = None
+        self.sam_origin = None
         self.resize_draft = False
         self.edit_box_id = self.expected_bbox = None
         self.prompt_history.clear()
@@ -495,6 +519,7 @@ class WizardApp:
 
     def _set_project(self, project, directory):
         self.project, self.directory = project, directory.resolve()
+        self.only_fill_reviews.set(False)
         self.grounding_prompt.set(project.grounding_prompt)
         self.project_title.configure(text=self.directory.name)
         self.class_name.set(project.labels[0] if project.labels else "")
@@ -568,7 +593,9 @@ class WizardApp:
         if latest is not None and not job.stop.is_set():
             if latest.get("event") == "commit":
                 self.video_stop.state(["disabled"])
-                self._message("偵測已完成，正在儲存待審畫格…")
+                self._message("處理已完成，正在讀取結果…")
+            elif latest.get("stage") == "sam_fill":
+                self._message(f"SAM 2.1 正在處理區間 {latest['frames_read'] + 1}／{latest['total_frames']}")
             elif latest.get("event") == "progress" and latest.get("stage") == "verifying":
                 self._message("正在核對已確認的影片和模型…")
             elif latest.get("event") == "progress":
@@ -583,6 +610,136 @@ class WizardApp:
         if self.video_import is not None and self.video_import.cancel():
             self.video_stop.state(["disabled"])
             self._message("正在停止影片處理…")
+
+    def assign_track(self):
+        entry = self._selected_record()
+        if not entry or not self.asset.get("video"):
+            return
+        name = simpledialog.askstring("指定同一物件", "同一扇門在各關鍵畫格使用相同名稱，例如左前門。",
+                                      initialvalue=entry.get("video_track", ""), parent=self.root)
+        if name is None:
+            return
+        try:
+            self.project.set_video_track(self.asset["id"], entry["id"], name)
+            self._reload_asset_record()
+            self._message(f"已指定物件「{name.strip()}」。確認該畫格的框與類別後標記已審核。")
+        except Exception as exc:
+            self._error("無法指定物件", exc)
+
+    def mark_cut(self):
+        try:
+            marked = self.project.toggle_video_cut(self.asset["id"])
+            if self.sam_origin is not None:
+                self._clear_box_draft()
+            self.sam_choices = []
+            self.sam_picker.set("SAM 建議框")
+            self.sam_picker.configure(values=())
+            self._reload_asset_record()
+            self._message("已標記此格為新鏡頭的開始。" if marked else "已移除此格的換鏡標記。")
+        except Exception as exc:
+            self._error("無法更新換鏡設定", exc)
+
+    def confirm_video_class(self):
+        entry = self._selected_record()
+        if not entry or not entry.get("needs_label_review"):
+            return
+        try:
+            self.project.set_video_class(self.asset["id"], entry["id"], self.class_name.get())
+            self._reload_asset_record()
+            self._message("已確認所選框的類別。")
+        except Exception as exc:
+            self._error("無法確認類別", exc)
+
+    def _start_sam_job(self, plan, finished, *, automatic=False):
+        project, aid = self.project, self.asset["id"]
+        job = self.video_import = VideoFill(plan, self.sam_dir)
+        self.video_stop.state(["!disabled"])
+        self.video_stop.pack(side="right")
+        self._message("正在以 SAM 2.1 核對影片並傳播偵測框…")
+
+        def show_error():
+            if automatic:
+                self._message("上一框暫時無法傳播。可用文字候選或手動畫框。", error=True)
+            return not automatic
+
+        self._start_task("video", lambda: job.run(project, aid), finished, "SAM 2.1 補框失敗", show_error=show_error)
+        self.root.after(120, lambda: self._poll_video(job))
+
+    def fill_video(self):
+        if self.task is not None or not self.asset or not self.asset.get("video"):
+            return
+        rate = simpledialog.askfloat("雙向補框", "每秒保存幾張補框畫格？",
+                                     initialvalue=10, minvalue=0.1, maxvalue=60, parent=self.root)
+        if rate is None:
+            return
+        try:
+            plan = self.project.video_fill_plan(self.asset["id"], rate)
+        except Exception as exc:
+            self._error("無法建立補框區間", exc)
+            return
+        if not plan["segments"]:
+            self._message("沒有可補框的區間。請確認兩端關鍵畫格均已審核、物件名稱相同，且中間仍有缺格。")
+            return
+
+        def finished(result):
+            if result is None:
+                self._message("已取消 SAM 補框。")
+                return
+            if result["imported_frames"]:
+                self.only_fill_reviews.set(True)
+            self._refresh_asset_list()
+            self._message(f"新增 {result['imported_frames']} 張待審、{result['added_boxes']} 個框。"
+                          f"略過 {result['skipped_intervals']} 個區間與 {result['skipped_frames']} 張缺框畫格。")
+
+        self._start_sam_job(plan, finished)
+
+    def preview_sam(self, *, automatic=False):
+        if not self.alive or self.task is not None or not self.asset or not self.sam_available or not self._box_mode():
+            return
+        asset, image = self.asset, self.image
+        if automatic and (self.box is not None or asset["annotations"]):
+            return
+        try:
+            plan = self.project.video_fill_plan(asset["id"], preview=True)
+        except Exception as exc:
+            if not automatic:
+                self._error("無法找上一框", exc)
+            return
+        if not plan["segments"]:
+            if not automatic:
+                self._message("上一張關鍵畫格需先指定物件並標記已審核。")
+            return
+
+        def finished(result):
+            if self.image is not image:
+                return
+            existing = {a.get("video_track") for a in self.asset["annotations"]}
+            self.sam_choices = [r for r in (result or []) if r["track"] not in existing]
+            self.sam_previous = plan["segments"][0]["left"]
+            self.sam_picker.set("選擇 SAM 建議框")
+            self.sam_picker.configure(values=[row["track"] for row in self.sam_choices])
+            self._schedule_canvas()
+            self._message(f"有 {len(self.sam_choices)} 個 SAM 建議框，可選擇後調整。"
+                          if self.sam_choices else "這格沒有可用的傳播框，可用文字候選或手畫。")
+
+        self._start_sam_job(plan, finished, automatic=automatic)
+
+    def _pick_sam_box(self, _event=None):
+        index = self.sam_picker.current()
+        if (not self._box_mode() or self.task is not None or self.edit_box_id is not None
+                or not 0 <= index < len(self.sam_choices)):
+            return
+        if self.box is not None and not messagebox.askyesno(
+                "更換框選草稿", "用選取的 SAM 候選取代現在的草稿？", parent=self.root):
+            self.sam_picker.set("選擇 SAM 建議框")
+            return
+        self._clear_box_draft()
+        row = self.sam_choices[index]
+        self.box = tuple(row["xyxy"])
+        self.sam_origin = row["track"], self.sam_previous
+        self.class_name.set(row["label"])
+        self._prompt_changed()
+        self._message("請確認物件類別，再微調或儲存。")
 
     def add_label(self):
         if not self.project or self.task_kind in {"import", "export", "video"} or self._repairing_saved() or self.edit_box_id:
@@ -599,8 +756,14 @@ class WizardApp:
         except Exception as exc:
             self._error("無法新增類別", exc)
 
-    def _refresh_asset_list(self):
+    def _listed_assets(self):
         assets = self.project.assets if self.project is not None else []
+        if self.only_fill_reviews.get():
+            return [a for a in assets if (a.get("video") or {}).get("sam_fill") and not a.get("reviewed")]
+        return assets
+
+    def _refresh_asset_list(self):
+        assets = self._listed_assets()
         current = {a["id"] for a in assets}
         for row_id in self.asset_tree.get_children():
             if row_id not in current:
@@ -611,11 +774,14 @@ class WizardApp:
             values = (asset["name"], status)
             if self.asset_tree.exists(aid):
                 self.asset_tree.item(aid, values=values)
+                self.asset_tree.move(aid, "", index)
             else:
                 self.asset_tree.insert("", index, iid=aid, values=values)
         completed = sum(bool(a.get("reviewed")) for a in assets)
         self.asset_summary.configure(text=f"{len(assets):,} 張圖片 · {completed:,} 張已審核")
-        if self.asset:
+        if self.only_fill_reviews.get() and (not self.asset or self.asset["id"] not in current):
+            self._select_asset(assets[0] if assets else None)
+        if self.asset and self.asset["id"] in current:
             self.asset_tree.selection_set(self.asset["id"])
             self.asset_tree.see(self.asset["id"])
         self._update_controls()
@@ -631,6 +797,9 @@ class WizardApp:
     def _select_asset(self, asset):
         self.asset, self.image = None, None
         self._grounding_prompt_changed()
+        self.sam_choices = []
+        self.sam_picker.set("SAM 建議框")
+        self.sam_picker.configure(values=())
         self._clear_preview()
         self.selected_annotation = None
         self._clear_box_draft()
@@ -650,11 +819,13 @@ class WizardApp:
         self._refresh_annotations()
         self._update_controls()
         self._schedule_canvas()
+        if asset and (asset.get("video") or {}).get("keyframe") and not asset.get("reviewed") and self._box_mode():
+            self.root.after(90, lambda: self.preview_sam(automatic=True) if self.asset is asset else None)
 
     def navigate(self, delta):
-        if not self.project or not self.project.assets:
+        assets = self._listed_assets()
+        if not assets:
             return
-        assets = self.project.assets
         index = self._asset_index()
         target = max(0, min(len(assets)-1, index + delta))
         if target != index:
@@ -666,7 +837,7 @@ class WizardApp:
         if self.asset is None:
             return -1
         aid = self.asset["id"]
-        return next((index for index, row in enumerate(self.project.assets) if row["id"] == aid), -1)
+        return next((index for index, row in enumerate(self._listed_assets()) if row["id"] == aid), -1)
 
     def _settings_changed(self, _event=None):
         self._prompt_changed()
@@ -703,11 +874,11 @@ class WizardApp:
         self._schedule_canvas()
 
     def _remember_prompts(self):
-        self.prompt_history.append((self.box, self.positive.copy(), self.negative.copy(), self.box_suggestion))
+        self.prompt_history.append((self.box, self.positive.copy(), self.negative.copy(), self.box_suggestion, self.sam_origin))
 
     def undo_prompt(self):
         if self.prompt_history and not self._repairing_saved():
-            self.box, self.positive, self.negative, self.box_suggestion = self.prompt_history.pop()
+            self.box, self.positive, self.negative, self.box_suggestion, self.sam_origin = self.prompt_history.pop()
             self._prompt_changed()
 
     def clear_prompts(self):
@@ -715,6 +886,7 @@ class WizardApp:
             self._remember_prompts()
             self.box = None
             self.box_suggestion = None
+            self.sam_origin = None
             self.positive, self.negative = [], []
             self._prompt_changed()
 
@@ -792,6 +964,7 @@ class WizardApp:
             self._remember_prompts()
             if not self.resize_draft:
                 self.box_suggestion = None
+                self.sam_origin = None
             self.box = (min(x, other_x), min(y, other_y), max(x, other_x), max(y, other_y))
             self._prompt_changed()
         else:
@@ -980,6 +1153,11 @@ class WizardApp:
 
     def _draw_prompts(self, canvas, ox, oy, scale):
         box = self.box
+        if not box and not self.drag_box and self._box_mode() and self.sam_choices:
+            left, top, right, bottom = self.sam_choices[0]["xyxy"]
+            canvas.create_rectangle(ox+left*scale, oy+top*scale, ox+right*scale, oy+bottom*scale,
+                                    outline=CANDIDATE, width=2, dash=(3, 4))
+            canvas.create_text(ox+left*scale, oy+top*scale, text="SAM 建議", anchor="sw", fill=CANDIDATE)
         if self.drag_box:
             (x, y), (other_x, other_y) = self.drag_box
             box = (x, y, other_x, other_y)
@@ -1093,7 +1271,7 @@ class WizardApp:
                                                                     expected_bbox=self.expected_bbox)
             else:
                 self.selected_annotation = self.project.add_box(self.asset["id"], label, self.box,
-                                                                suggestion=self.box_suggestion)
+                                                                suggestion=self.box_suggestion, propagated=self.sam_origin)
         except Exception as exc:
             self._error("無法儲存偵測框", exc)
             return
@@ -1232,7 +1410,9 @@ class WizardApp:
             type_label = "偵測框" if kind == "bbox" else "遮罩"
             if annotation.get("source") == "video_auto" and not self.asset.get("reviewed"):
                 type_label = "待複核"
-            track = annotation.get("track_id")
+            if annotation.get("source") == "sam_fill" and not self.asset.get("reviewed"):
+                type_label = "需確認類別" if annotation.get("needs_label_review") else "補框待審"
+            track = annotation.get("video_track", annotation.get("track_id"))
             label = annotation["label"] if track is None else f"{annotation['label']} · #{track}"
             tree.insert("", "end", iid=annotation["id"], values=(label, type_label))
         if self.selected_annotation and tree.exists(self.selected_annotation):
@@ -1293,7 +1473,14 @@ class WizardApp:
             return
         project = self.project
         self._message("正在匯出已儲存的標註…")
-        action = project.export_yolo if format_name == "yolo" else project.export_coco
+        if format_name == "yolo":
+            has_pending = any((a.get("video") or {}).get("sam_fill") and not a.get("reviewed") for a in project.assets)
+            include = has_pending and messagebox.askyesno(
+                "YOLO 訓練專用畫格", "另附符合條件的未複核補框，僅供訓練？",
+                default="no", parent=self.root)
+            action = lambda path: project.export_yolo(path, include_pending_fill=include)
+        else:
+            action = project.export_coco
         self._start_task("export", lambda: action(Path(directory)), lambda path: self._after_export(path, name),
                          f"無法匯出 {name}")
 
@@ -1349,6 +1536,22 @@ class WizardApp:
         enable(self.open_button, not disk_busy)
         enable(self.import_button, has_project and not busy)
         enable(self.video_button, has_project and not busy)
+        video = self.asset.get("video") if has_asset else None
+        enable(self.fill_button, bool(video) and self.sam_available and not busy)
+        if video:
+            self.video_tools.pack(fill="x", padx=11, pady=4, before=self.annotation_tree.master)
+        else:
+            self.video_tools.pack_forget()
+        if video and box_mode:
+            self.sam_options.pack(fill="x", padx=11, pady=(0, 4))
+        else:
+            self.sam_options.pack_forget()
+        enable(self.track_button, bool(video and selected and selected.get("type") == "bbox") and not disk_busy)
+        enable(self.cut_button, bool(video) and not disk_busy)
+        self.cut_button.configure(text="移除換鏡" if video and video.get("cut_before") else "在此換鏡")
+        enable(self.confirm_class_button, bool(selected and selected.get("needs_label_review")) and not disk_busy)
+        enable(self.sam_hint, bool(video) and self.sam_available and not busy and not editing_box)
+        self.sam_picker.configure(state="readonly" if self.sam_choices and not busy and not editing_box else "disabled")
         enable(self.grounding_button, has_asset and box_mode and not busy and not editing_box)
         self.grounding_entry.configure(state="normal" if has_project and not busy else "disabled")
         self.grounding_picker.configure(state="readonly" if self.grounding_choices and not busy else "disabled")
@@ -1358,7 +1561,7 @@ class WizardApp:
         enable(self.export_coco_button, export_possible)
         enable(self.new_label_button, has_project and not disk_busy and not editing_saved and not editing_box)
         enable(self.previous_button, index > 0)
-        enable(self.next_button, has_project and index < len(self.project.assets)-1)
+        enable(self.next_button, has_project and index < len(self._listed_assets())-1)
         self.mode_picker.configure(state="disabled" if disk_busy else "readonly")
         class_editable = has_project and self.project.labels and not disk_busy and not editing_saved and not editing_box
         self.class_picker.configure(state="readonly" if class_editable else "disabled")

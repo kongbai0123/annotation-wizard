@@ -390,11 +390,10 @@ def console_python() -> Path:
     return exe.with_name("python.exe") if exe.name.lower() == "pythonw.exe" else exe
 
 
-class VideoImport:
-    """Own the subprocess, hold staged files until completion and commit once."""
+class StagedVideoJob:
+    """Own a cancellable subprocess and commit only its completed result."""
 
-    def __init__(self, approval: VideoApproval):
-        self.approval = approval
+    def __init__(self):
         self.stop = Event()
         self._commit_lock = Lock()
         self.phase = "working"
@@ -445,20 +444,13 @@ class VideoImport:
         except ProcessLookupError:
             pass
 
-    def run(self, project) -> dict | None:
+    def run_staged(self, command, commit):
         if self.stop.is_set():
             return None
         with TemporaryDirectory(prefix="annotation-video-") as temp:
             directory = Path(temp)
             out = directory / "result"
-            approval = self.approval
-            cmd = [str(approval.interpreter), str(ROOT / "video_worker.py"), "--video", str(approval.video),
-                   "--out", str(out), "--sample-fps", str(approval.sample_fps),
-                   "--conf", str(approval.confidence), "--approved-video-sha256", approval.video_sha256]
-            if approval.model is None:
-                cmd.append("--keyframes")
-            else:
-                cmd.extend(("--model", str(approval.model), "--approved-model-sha256", approval.model_sha256))
+            cmd = command(directory, out)
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUNBUFFERED"] = "1"
@@ -489,6 +481,26 @@ class VideoImport:
                     return None
                 self.phase = "commit"
             self.events.put({"event": "commit"})
-            return project.import_video_annotations(out / "result.json",
-                                                    approved_video_sha256=approval.video_sha256,
-                                                    approved_model_sha256=approval.model_sha256)
+            return commit(out / "result.json")
+
+
+class VideoImport(StagedVideoJob):
+    def __init__(self, approval: VideoApproval):
+        super().__init__()
+        self.approval = approval
+
+    def run(self, project) -> dict | None:
+        approval = self.approval
+
+        def command(_directory, out):
+            cmd = [str(approval.interpreter), str(ROOT / "video_worker.py"), "--video", str(approval.video),
+                   "--out", str(out), "--sample-fps", str(approval.sample_fps),
+                   "--conf", str(approval.confidence), "--approved-video-sha256", approval.video_sha256]
+            if approval.model is None:
+                cmd.append("--keyframes")
+            else:
+                cmd.extend(("--model", str(approval.model), "--approved-model-sha256", approval.model_sha256))
+            return cmd
+
+        return self.run_staged(command, lambda path: project.import_video_annotations(
+            path, approved_video_sha256=approval.video_sha256, approved_model_sha256=approval.model_sha256))

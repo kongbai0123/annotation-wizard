@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from bisect import bisect_right
 import hashlib
 import json
 import math
@@ -201,6 +202,21 @@ def _video_annotations(boxes, asset: dict, model_labels: dict[int, str]) -> list
     return rows
 
 
+def _stage_frame(root, staging, name, identifier, digest, dimensions):
+    frame_path = root / name
+    if frame_path.resolve() != frame_path or not frame_path.is_file():
+        raise ValueError("處理結果缺少影格檔案，或影格路徑超出工作區。")
+    candidate = Path(staging) / f"{identifier}.png"
+    shutil.copyfile(frame_path, candidate)
+    if _digest(candidate) != digest:
+        raise ValueError("影片影格在匯入前已變更。")
+    with Image.open(candidate) as frame:
+        if frame.format != "PNG" or frame.size != dimensions:
+            raise ValueError("影片影格檔案與記錄的格式或尺寸不符。")
+        frame.verify()
+    return candidate
+
+
 class Project:
     """Images are immutable PNGs and edits replace a single versioned JSON manifest."""
 
@@ -370,17 +386,7 @@ class Project:
                     if (source["sha256"], index) in known:
                         skipped += 1
                         continue
-                    frame_path = manifest_path.parent / filename
-                    if frame_path.resolve() != frame_path or not frame_path.is_file():
-                        raise ValueError("處理結果缺少影格檔案，或影格路徑超出工作區。")
-                    candidate = Path(staging) / f"{asset_id}.png"
-                    shutil.copyfile(frame_path, candidate)
-                    if _digest(candidate) != digest:
-                        raise ValueError("影片影格在匯入前已變更。")
-                    with Image.open(candidate) as frame:
-                        if frame.format != "PNG" or frame.size != dimensions:
-                            raise ValueError("影片影格檔案與記錄的格式或尺寸不符。")
-                        frame.verify()
+                    candidate = _stage_frame(manifest_path.parent, staging, filename, asset_id, digest, dimensions)
                     for annotation in asset["annotations"]:
                         if annotation["label"] not in data["labels"]:
                             data["labels"].append(annotation["label"])
@@ -390,6 +396,128 @@ class Project:
 
                 self._commit_images(staged, data)
             return {"imported_frames": len(staged), "added_boxes": box_count, "skipped_frames": skipped}
+
+    def video_fill_plan(self, asset_id, sample_fps=10, *, preview=False):
+        from video_fill import plan_fill
+
+        if not 0.1 <= _finite(sample_fps, "儲存畫格率") <= 60:
+            raise ValueError("儲存畫格率須在 0.1 至 60 FPS 之間。")
+        data = _read_manifest(self.directory)
+        return plan_fill(data["assets"], _asset(data, asset_id), sample_fps, preview=preview)
+
+    def import_video_fill(self, path, asset_id, plan):
+        from video_fill import plan_fill, video_frames
+
+        path = Path(path).resolve(strict=True)
+        result = json.loads(path.read_text(encoding="utf-8"))
+        if result.get("source_sha256") != plan["video"]["sha256"] or plan["preview"]:
+            raise ValueError("補框結果與核對過的影片不符。")
+        width, height = plan["width"], plan["height"]
+        with _project_lock(self.directory):
+            data = _read_manifest(self.directory)
+            selected = _asset(data, asset_id)
+            if plan_fill(data["assets"], selected, plan["sample_fps"]) != plan:
+                raise ValueError("影片畫格或關鍵框在補框期間已變更，請重新執行。")
+            originals = video_frames(data["assets"], selected)
+            existing = plan["existing"]
+            used = set(existing)
+            pending = {}
+            count = 0
+            previous = -1
+            with tempfile.TemporaryDirectory(prefix=".sam-fill-", dir=self.directory) as staging:
+                staged = []
+                for row in result["frames"]:
+                    idx, segment = row["frame_index"], row["segment"]
+                    if type(idx) is not int or idx <= previous or type(segment) is not int or not 0 <= segment < len(plan["segments"]):
+                        raise ValueError("補框影格順序或區間無效。")
+                    previous = idx
+                    bounds = plan["segments"][segment]
+                    first, last = bounds["left"], bounds["right"]
+                    stamp = _finite(row["time_ms"], "補框時間戳記")
+                    if (not first["index"] < idx < last["index"] or idx in used
+                            or not first["time_ms"] <= stamp <= last["time_ms"]):
+                        raise ValueError("補框影格不在對應區間內。")
+                    filename = f"frames/{idx:09d}.png"
+                    digest = row["sha256"]
+                    if row["file"] != filename or not _SHA256.fullmatch(digest):
+                        raise ValueError("補框影格檔案資料無效。")
+                    identifier = uuid4().hex
+                    asset = {"id": identifier, "name": f"{Path(plan['video']['path']).stem} · {stamp / 1000:.3f}s",
+                             "width": width, "height": height, "source_sha256": digest, "image_sha256": digest,
+                             "reviewed": False, "annotations": [],
+                             "video": {**plan["video"], "frame_index": idx, "time_ms": stamp,
+                                       "sample_fps": plan["sample_fps"], "sam_fill": True,
+                                       "anchors": [first["asset_id"], last["asset_id"]]}}
+                    tracks = set()
+                    for box in row["boxes"]:
+                        track, label = box["track"], box["label"]
+                        if track in tracks or track not in first["boxes"]:
+                            raise ValueError("補框物件名稱重複或與起始框不符。")
+                        a, b = first["boxes"][track]["label"], last["boxes"][track]["label"]
+                        if label not in (a, b) or label not in data["labels"] or box["needs_label_review"] is not (a != b):
+                            raise ValueError("補框物件類別與關鍵框不符。")
+                        tracks.add(track)
+                        asset["annotations"].append({"id": uuid4().hex, "type": "bbox", "label": label,
+                                                     "source": "sam_fill", "score": None, "video_track": track,
+                                                     "needs_label_review": a != b,
+                                                     **_box_geometry(asset, box["xyxy"])})
+                    if tracks != first["boxes"].keys():
+                        raise ValueError("補框結果缺少對應物件。")
+                    staged.append(_stage_frame(path.parent, staging, filename, identifier, digest, (width, height)))
+                    count += len(tracks)
+                    following = originals[bisect_right(existing, idx)]["id"]
+                    pending.setdefault(following, []).append(asset)
+                data["assets"] = [a for original in data["assets"]
+                                  for a in (*pending.get(original["id"], ()), original)]
+                self._commit_images(staged, data)
+            return {"imported_frames": len(staged), "added_boxes": count, "skipped_frames": result["missed"],
+                    "skipped_intervals": plan["skipped"]}
+
+    def set_video_track(self, asset_id, annotation_id, name):
+        name = name.strip()
+        if not name or len(name) > 64:
+            raise ValueError("請輸入 1 至 64 字元的物件名稱。")
+        with _project_lock(self.directory):
+            data = _read_manifest(self.directory)
+            asset = _asset(data, asset_id)
+            record = self._video_box(asset, annotation_id)
+            self._check_video_track(asset, name, annotation_id)
+            record["video_track"] = name
+            self._commit(data)
+
+    @staticmethod
+    def _check_video_track(asset, track, annotation_id=None):
+        if any(a["id"] != annotation_id and a.get("video_track") == track for a in asset["annotations"]):
+            raise ValueError("同一畫格中的每個物件須使用不同名稱。")
+
+    @staticmethod
+    def _video_box(asset, annotation_id):
+        if asset.get("video"):
+            for annotation in asset["annotations"]:
+                if annotation["id"] == annotation_id and annotation.get("type") == "bbox":
+                    return annotation
+        raise ValueError("請選擇影片畫格中的已儲存框。")
+
+    def set_video_class(self, asset_id, annotation_id, label):
+        with _project_lock(self.directory):
+            data = _read_manifest(self.directory)
+            asset = _asset(data, asset_id)
+            if label not in data["labels"]:
+                raise ValueError("請先選擇已建立的類別。")
+            record = self._video_box(asset, annotation_id)
+            record.update(label=label, needs_label_review=False)
+            asset["reviewed"] = False
+            self._commit(data)
+
+    def toggle_video_cut(self, asset_id):
+        with _project_lock(self.directory):
+            data = _read_manifest(self.directory)
+            video = _asset(data, asset_id).get("video")
+            if not video:
+                raise ValueError("請先選擇影片畫格。")
+            video["cut_before"] = not video.get("cut_before", False)
+            self._commit(data)
+            return video["cut_before"]
 
     def add_label(self, name: str) -> str:
         if not isinstance(name, str):
@@ -463,7 +591,7 @@ class Project:
                 self._commit(data)
         return prompt
 
-    def add_box(self, asset_id: str, label: str, box, *, suggestion=None) -> str:
+    def add_box(self, asset_id: str, label: str, box, *, suggestion=None, propagated=None) -> str:
         """Save a confirmed detection box in original-image pixels."""
         with _project_lock(self.directory):
             data = _read_manifest(self.directory)
@@ -481,6 +609,15 @@ class Project:
                 if not 0 <= score <= 1:
                     raise ValueError("候選分數無效。")
                 record.update(source="grounding_dino", score=score, suggestion={"prompt": prompt, "rank": rank})
+            if propagated is not None:
+                from video_fill import plan_fill
+
+                track, previous = propagated
+                segments = plan_fill(data["assets"], asset, 10, preview=True)["segments"]
+                if not segments or segments[0]["left"] != previous or track not in previous["boxes"]:
+                    raise ValueError("SAM 傳播的上一關鍵框在使用期間已變更。")
+                self._check_video_track(asset, track)
+                record.update(source="sam_forward", video_track=track, from_asset=previous["asset_id"])
             asset["annotations"].append(record)
             asset["reviewed"] = False
             self._commit(data)
@@ -501,6 +638,8 @@ class Project:
             else:
                 annotation.update(geometry)
                 asset["reviewed"] = False
+                if annotation.get("source") == "sam_fill":
+                    asset["video"]["keyframe"] = True
                 self._commit(data)
         return annotation_id
 
@@ -513,6 +652,8 @@ class Project:
                 raise ValueError("找不到要移除的標註。")
             asset["annotations"] = remaining
             asset["reviewed"] = False
+            if (asset.get("video") or {}).get("sam_fill"):
+                asset["video"]["sam_fill_incomplete"] = True
             self._commit(data)
 
     def set_reviewed(self, asset_id: str, reviewed: bool) -> None:
@@ -521,6 +662,8 @@ class Project:
         with _project_lock(self.directory):
             data = _read_manifest(self.directory)
             asset = _asset(data, asset_id)
+            if reviewed and any(a.get("needs_label_review") for a in asset["annotations"]):
+                raise ValueError("請先選取待確認的框，指定類別後按「確認類別」。")
             if asset.get("reviewed", False) != reviewed:
                 asset["reviewed"] = reviewed
                 self._commit(data)
@@ -539,8 +682,9 @@ class Project:
         runs = np.arange(len(counts), dtype=np.int64) % 2 == 1
         return np.repeat(runs, counts).reshape(size, order="F")
 
-    def _export_data(self) -> tuple[list[str], list[dict]]:
-        data = _read_manifest(self.directory)
+    def _export_data(self, data=None) -> tuple[list[str], list[dict]]:
+        if data is None:
+            data = _read_manifest(self.directory)
         assets = [asset for asset in data["assets"] if asset.get("reviewed")
                   or (asset["annotations"] and not asset.get("video"))]
         if not assets:
@@ -603,22 +747,39 @@ class Project:
             _write_json(staging / "annotations.json", coco)
         return Path(directory).resolve() / "annotations.json"
 
-    def export_yolo(self, directory: Path) -> Path:
+    def export_yolo(self, directory: Path, *, include_pending_fill=False) -> Path:
         """Export paired images and YOLO detection labels with a zero-based class list."""
-        labels, assets = self._export_data()
+        data = _read_manifest(self.directory)
+        labels, assets = self._export_data(data)
         categories = {name: i for i, name in enumerate(labels)}
+        pending = []
+        if include_pending_fill:
+            pending = [a for a in data["assets"] if not a.get("reviewed") and (a.get("video") or {}).get("sam_fill")
+                       and not a["video"].get("sam_fill_incomplete") and a["annotations"]
+                       and all(b["source"] == "sam_fill" and not b.get("needs_label_review")
+                               for b in a["annotations"])]
         with self._export_target(directory) as staging:
-            (staging / "labels").mkdir()
-            for asset in assets:
-                name = self._export_image(staging, asset)
-                image_width, image_height = asset["width"], asset["height"]
-                rows = []
-                for annotation in asset["annotations"]:
-                    x, y, width, height = annotation["bbox"]
-                    coords = ((x + width / 2) / image_width, (y + height / 2) / image_height,
-                              width / image_width, height / image_height)
-                    normalized = " ".join(f"{value:.10f}" for value in coords)
-                    rows.append(f"{categories[annotation['label']]} {normalized}\n")
-                (staging / "labels" / f"{Path(name).stem}.txt").write_text("".join(rows), encoding="utf-8", newline="\n")
-            (staging / "classes.txt").write_text("".join(f"{label}\n" for label in labels), encoding="utf-8", newline="\n")
+            self._export_yolo_rows(staging, labels, categories, assets)
+            if pending:
+                train = staging / "training-only"
+                (train / "images").mkdir(parents=True)
+                self._export_yolo_rows(train, labels, categories, pending)
+                _write_json(train / "provenance.json", {"source": "sam_fill", "reviewed": False,
+                    "images": [{"file": f"{a['id']}.png", "video_sha256": a["video"]["sha256"],
+                                "frame_index": a["video"]["frame_index"], "anchors": a["video"]["anchors"]}
+                               for a in pending]})
         return Path(directory).resolve() / "classes.txt"
+
+    def _export_yolo_rows(self, staging, labels, categories, assets):
+        (staging / "labels").mkdir()
+        for asset in assets:
+            name = self._export_image(staging, asset)
+            iw, ih = asset["width"], asset["height"]
+            rows = []
+            for annotation in asset["annotations"]:
+                x, y, w, h = annotation["bbox"]
+                coords = ((x + w / 2) / iw, (y + h / 2) / ih, w / iw, h / ih)
+                normalized = " ".join(f"{value:.10f}" for value in coords)
+                rows.append(f"{categories[annotation['label']]} {normalized}\n")
+            (staging / "labels" / f"{Path(name).stem}.txt").write_text("".join(rows), encoding="utf-8", newline="\n")
+        (staging / "classes.txt").write_text("".join(f"{label}\n" for label in labels), encoding="utf-8", newline="\n")
