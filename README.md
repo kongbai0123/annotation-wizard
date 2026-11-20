@@ -49,6 +49,16 @@ $VideoPython = 'D:\software\vision-workbench\.venv-models\ultralytics\Scripts\py
 4. 以「補框待審」檢查新增畫格。開關狀態有變時，選取提示為「需確認類別」的框，選好類別後按「確認類別」。修正框並複核畫格後，再按「SAM 2.1 雙向補框」可更新受影響區間內仍待審的自動框。已審核或人工編修的畫格保留原資料。
 5. 一般匯出會包含已複核的影片畫格。YOLO 匯出可另附符合條件的未複核補框至 `training-only/`，並附 `provenance.json`。尚待確認類別的畫格會留在專案待審。
 
+## AI 批量標註與雙層閉迴圈 v2
+
+在主視窗開啟「AI 批量標註」，選擇圖片或影片關鍵畫格、物件類別和標法。MM 提出候選，Qwen 判斷類別並標記不確定。新作業每張最多局部重查兩次，框界有疑點可勾選「SAM 框界抽查」。在「影子待審」看原因，修正後確認整張。批量與單張工作台共用已儲存的人工標註。
+
+「批次驗收」以固定清冊分層抽查自動候選、扣留和人工確認畫格。人工封存整張盲標後，才顯示抽檢前框。結果記錄到該作業的影子驗收檔。正式放行上限和改版門檻由負責人核准後再生效。
+
+「訓練與驗收」可用核准的本地專案資料匯出 YOLO 並從架構隨機初始化。獨立驗收依來源分離，固定訓練完成的權重後才計分。[流程圖與冒煙驗證](docs/closed-loop-v2-verification.md)
+
+批量推論使用 Windows AppContainer 的本機 CUDA 環境。設定 `ANNOTATION_WIZARD_ISOLATION_HOME` 指向已準備好的隔離資料夾，其中 `runtime/python.exe` 須有 CUDA 版 PyTorch、Transformers、Pillow 與 OpenCV。訓練再需要 Ultralytics 的 YOLO26 支援。可設定 `ANNOTATION_WIZARD_MODELS_HOME` 指向已核對的本機模型父資料夾，內含 `MM-Grounding-DINO-Tiny`、`Qwen3-VL-4B-Instruct` 和選配的 `sam2.1-hiera-tiny`。Qwen 目錄應含權重來源與檔案雜湊紀錄。
+
 ## 重建執行環境
 
 需要 Windows、64 位元 Python 3.13，以及 Windows .NET Framework 4.x 的 C# 編譯器。安裝程式會準備專案自己的 `.venv`、驗證本機權重，並重新產生 `AnnotationWizard.exe`。
