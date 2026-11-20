@@ -11,6 +11,8 @@
 
 ## 冒煙驗證
 
+下表記錄發布前的本機驗證。新增測試、GUI 冒煙腳本與完整日誌保存在本機開發專案。
+
 | 檢查 | 範圍 |
 |---|---|
 | 單元測試 | **110 項通過、2 項因工作樹內無權重而略過。** 檢查覆核、抽樣上下界、誤放行狀態、清冊驗證、獨立來源、舊專案格式與模型替身。 |
@@ -18,13 +20,5 @@
 | Windows AppContainer | **2 張實圖通過流程驗證。** MM 共產生 20 個候選，Qwen 採用 2 框，選配 SAM 核對 2 框，影子模式送審 1 張。3 項網路探測均被拒，沙箱核實 CUDA 可用。推論耗時 24.396 秒，整次作業耗時 39.515 秒。 |
 
 兩張實圖都未觸發局部重查，重查停損由測試替身驗證。實際命中率和誤放行率需使用獨立的整張人工參考估計。
-
-在準備好本機 Python 環境後可重跑測試。
-
-```powershell
-& ./.venv/Scripts/python.exe -B -m unittest discover -s . -p 'test_*.py' -v
-New-Item -ItemType Directory -Force -Path logs | Out-Null
-& ./.venv/Scripts/python.exe -B demo/smoke_closed_loop_workbench.py --receipt logs/closed-loop-smoke.json
-```
 
 本機模型與 AppContainer 執行環境的配置見 [README](../README.md)。驗收結果只適用於當批抽檢；評估新影片或類別應使用來源獨立的人工參考。
