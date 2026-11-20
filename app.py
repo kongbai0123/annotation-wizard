@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from hashlib import file_digest
 from math import ceil, floor
 from pathlib import Path
 from queue import Empty
@@ -116,6 +117,8 @@ class WizardApp:
         self.video_import: VideoImport | None = None
         self.alive = True
         self.closing = False
+        self.active_workspace = "editor"
+        self.ai_pane = None
         self.engine = SegmentationEngine(model_dir)
         self.sam_dir = model_dir.resolve()
         self.sam_available = all((model_dir / filename).is_file() for filename in (
@@ -187,8 +190,23 @@ class WizardApp:
         for button in (self.new_button, self.open_button, self.export_coco_button, self.export_button):
             button.pack(side="left", padx=(7, 0))
 
-        area = tk.Frame(self.root, bg=BG)
-        area.pack(fill="both", expand=True, padx=20)
+        navigation = tk.Frame(self.root, bg=BG)
+        navigation.pack(fill="x", padx=20, pady=(0, 8))
+        self.editor_button = self._button(navigation, "輸入與標註", self.show_single_editor, primary=True)
+        self.training_button = self._button(navigation, "訓練與驗收", self.show_generic_training)
+        self.editor_button.pack(side="left", padx=(0, 6))
+        self.training_button.pack(side="left")
+        self.annotation_modes = tk.Frame(self.root, bg=BG)
+        self.annotation_modes.pack(fill="x", padx=20, pady=(0, 8))
+        self.single_button = self._button(self.annotation_modes, "單張標註", self.show_single_editor, primary=True)
+        self.ai_button = self._button(self.annotation_modes, "AI 批量標註", self.show_generic_ai)
+        self.single_button.pack(side="left", padx=(0, 5))
+        self.ai_button.pack(side="left")
+
+        self.workspace_host = tk.Frame(self.root, bg=BG)
+        self.workspace_host.pack(fill="both", expand=True, padx=20)
+        self.workspace = area = tk.Frame(self.workspace_host, bg=BG)
+        area.pack(fill="both", expand=True)
         area.grid_columnconfigure(0, minsize=210)
         area.grid_columnconfigure(1, weight=1, minsize=450)
         area.grid_columnconfigure(2, minsize=290)
@@ -406,12 +424,13 @@ class WizardApp:
         messagebox.showerror(title, str(exc), parent=self.root)
 
     def _key(self, event, callback):
-        if event.widget.winfo_class() not in {"Entry", "TEntry", "Text", "TCombobox", "Treeview", "Spinbox"}:
+        if (self.active_workspace == "editor"
+                and event.widget.winfo_class() not in {"Entry", "TEntry", "Text", "TCombobox", "Treeview", "Spinbox"}):
             callback()
             return "break"
 
     def _tool_key(self, event):
-        if event.state & 0xC:
+        if self.active_workspace != "editor" or event.state & 0xC:
             return
         tools = {"b": "box", "p": "positive", "n": "negative"}
         tool = tools.get(event.keysym.lower())
@@ -485,8 +504,79 @@ class WizardApp:
             self._prompt_changed()
             self._message("已捨棄框選草稿。")
 
+    def _generic_draft(self):
+        if self.ai_pane and (self.ai_pane.dirty or self.ai_pane.class_editor_open):
+            self._message("請先儲存或捨棄目前的批量編輯。", error=True)
+            return True
+        return False
+
+    def _switch_workspace(self, mode):
+        if self.task is not None or (mode != self.active_workspace and self._generic_draft()):
+            return False
+        if (mode != "editor" and self.active_workspace == "editor"
+                and (self.box or self.preview or self.positive or self.negative or self._repairing_saved())):
+            self._message("先儲存或捨棄目前的單張草稿，再切換工作區。", error=True)
+            return False
+        if mode == "editor":
+            if self.ai_pane is not None:
+                self.ai_pane.pack_forget()
+            self.workspace.pack(fill="both", expand=True)
+        else:
+            if self.ai_pane is None:
+                from generic_workbench import GenericWorkbench
+
+                self.ai_pane = GenericWorkbench(self.workspace_host, self)
+            self.workspace.pack_forget()
+            self.ai_pane.show_mode(mode)
+            self.ai_pane.attach(self.project)
+            self.ai_pane.pack(fill="both", expand=True)
+        self.active_workspace = mode
+        if mode == "train":
+            self.annotation_modes.pack_forget()
+        else:
+            self.annotation_modes.pack(fill="x", padx=20, pady=(0, 8), before=self.workspace_host)
+        for button, selected in ((self.editor_button, mode != "train"), (self.training_button, mode == "train"),
+                                 (self.single_button, mode == "editor"), (self.ai_button, mode == "ai")):
+            button.configure(style="Primary.TButton" if selected else "TButton")
+        self._update_controls()
+        return True
+
+    def show_generic_ai(self):
+        return self._switch_workspace("ai")
+
+    def show_generic_training(self):
+        return self._switch_workspace("train")
+
+    def show_single_editor(self):
+        row = (self.ai_pane.rows.get(self.ai_pane.selected_frame) if self.active_workspace == "ai" else None)
+        if not self._switch_workspace("editor"):
+            return False
+        if row and row.get("status") != "independent_test" and self.project:
+            asset = next((asset for asset in self.project.assets if asset["id"] == row["id"]), None)
+            if asset:
+                self.only_fill_reviews.set(False)
+                self._select_asset(asset)
+                self._refresh_asset_list()
+        return True
+
+    def refresh_annotation_project(self):
+        """Reload shared class labels and reviewed annotations after a batch edit."""
+        if self.project is None:
+            return
+        self.project = Project.open(self.project.directory)
+        if self.ai_pane is not None:
+            self.ai_pane.project = self.project
+        self.class_picker.configure(values=self.project.labels)
+        if self.class_name.get() not in self.project.labels:
+            self.class_name.set(self.project.labels[0] if self.project.labels else "")
+        if self.asset:
+            self.asset = next((asset for asset in self.project.assets if asset["id"] == self.asset["id"]), None)
+        self._refresh_annotations()
+        self._schedule_canvas()
+        self._refresh_asset_list()
+
     def new_project(self):
-        if self.task_kind in {"import", "export", "video"}:
+        if self.task_kind in {"import", "export", "video", "generic_ai"} or self._generic_draft():
             return
         parent = filedialog.askdirectory(title="選擇存放新專案的位置", parent=self.root)
         if not parent:
@@ -505,13 +595,15 @@ class WizardApp:
             self._error("無法建立專案", exc)
 
     def open_project(self):
-        if self.task_kind in {"import", "export", "video"}:
+        if self.task_kind in {"import", "export", "video", "generic_ai"} or self._generic_draft():
             return
         directory = filedialog.askdirectory(title="選擇含 project.json 的專案資料夾", parent=self.root)
         if directory:
             self.open_path(Path(directory))
 
     def open_path(self, directory: Path):
+        if self.task_kind in {"import", "export", "video", "generic_ai"} or self._generic_draft():
+            return
         try:
             self._set_project(Project.open(directory), directory)
         except Exception as exc:
@@ -526,9 +618,10 @@ class WizardApp:
         self.class_picker.configure(values=project.labels)
         self._select_asset(project.assets[0] if project.assets else None)
         self._refresh_asset_list()
+        self._switch_workspace("editor")
         self._message(f"專案位置　{self.directory}")
 
-    def import_images(self):
+    def import_images(self, *, return_to_ai=False):
         if self.project is None or self.task is not None:
             return
         files = filedialog.askopenfilenames(title="選擇要匯入的圖片", parent=self.root,
@@ -537,23 +630,39 @@ class WizardApp:
         if not files:
             return
         project = self.project
+        paths = [Path(file) for file in files]
         self._message(f"正在匯入 {len(files)} 張圖片…")
-        self._start_task("import", lambda: project.add_images([Path(file) for file in files]),
-                         self._after_import, "無法匯入圖片")
 
-    def _after_import(self, added):
+        def ingest():
+            if not return_to_ai:
+                return project.add_images(paths), None
+            before = {asset["id"] for asset in project.assets}
+            sources = set()
+            for path in paths:
+                with path.open("rb") as stream:
+                    sources.add(file_digest(stream, "sha256").hexdigest())
+            count = project.add_images(paths)
+            selected = [asset["id"] for asset in project.assets
+                        if asset["id"] not in before or asset.get("source_sha256") in sources]
+            return count, selected
+
+        self._start_task("import", ingest, lambda result: self._after_import(*result), "無法匯入圖片")
+
+    def _after_import(self, added, ai_inputs=None):
         if self.project.assets and self.asset is None:
             self._select_asset(self.project.assets[0])
         self._refresh_asset_list()
         self._message(f"新增 {added} 張圖片")
+        if ai_inputs is not None and self.show_generic_ai():
+            self.ai_pane.select_inputs(ai_inputs)
 
-    def import_video(self):
+    def import_video(self, *, keyframes=False):
         if self.project is None or self.task is not None:
             return
         chosen = filedialog.askopenfilename(title="選擇影片以預覽與審查", parent=self.root, filetypes=VIDEO_TYPES)
         if not chosen:
             return
-        approval = VideoReviewDialog(self.root, Path(chosen)).show()
+        approval = VideoReviewDialog(self.root, Path(chosen), keyframes=keyframes).show()
         if approval is None:
             return
         project = self.project
@@ -577,6 +686,9 @@ class WizardApp:
             imported, boxes, skipped = (result[key] for key in ("imported_frames", "added_boxes", "skipped_frames"))
             self._message(f"匯入 {imported:,} 張畫格、{boxes:,} 個候選框，略過 {skipped:,} 張重複畫格。"
                           "請逐張複核，再標記畫格已審核。")
+            if keyframes and self.show_generic_ai():
+                self.ai_pane.select_inputs(asset["id"] for asset in project.assets
+                                           if asset.get("video", {}).get("sha256") == approval.video_sha256)
 
         self._start_task("video", lambda: job.run(project), after, "無法匯入影片標註")
         self.root.after(120, lambda: self._poll_video(job))
@@ -1458,7 +1570,7 @@ class WizardApp:
             self._error("無法更新審核狀態", exc)
 
     def export(self, format_name="coco"):
-        if self.project is None or self.task is not None:
+        if self.project is None or self.task is not None or self._generic_draft():
             return
         name = format_name.upper()
         directory = filedialog.askdirectory(title=f"選擇空的 {name} 匯出資料夾", parent=self.root)
@@ -1481,7 +1593,7 @@ class WizardApp:
         self._message(f"已匯出至 {path}")
         messagebox.showinfo(f"{name} 已匯出", str(path), parent=self.root)
 
-    def _start_task(self, kind, action, completed, error_title, *, show_error=lambda: True):
+    def _start_task(self, kind, action, completed, error_title, *, show_error=lambda: True, on_error=None):
         self.task_kind = kind
         self.task = future = self.worker.submit(action)
         self._update_controls()
@@ -1504,7 +1616,10 @@ class WizardApp:
                 if not self.closing:
                     completed(result)
             except Exception as exc:
-                if show_error():
+                if on_error is not None:
+                    self._message(error_title, error=True)
+                    on_error(exc)
+                elif show_error():
                     self._error(error_title, exc)
             finally:
                 if self.closing:
@@ -1517,7 +1632,7 @@ class WizardApp:
         def enable(button, available):
             button.state(["!disabled" if available else "disabled"])
         has_project, has_asset = self.project is not None, self.asset is not None
-        busy, disk_busy = self.task is not None, self.task_kind in {"import", "export", "video"}
+        busy, disk_busy = self.task is not None, self.task_kind in {"import", "export", "video", "generic_ai"}
         box_mode, editing_box = self._box_mode(), self.edit_box_id is not None
         has_prompts = bool(self.box or self.positive or self.negative)
         candidate_current = self._preview_is_current()
@@ -1527,6 +1642,10 @@ class WizardApp:
         index = self._asset_index()
         enable(self.new_button, not disk_busy)
         enable(self.open_button, not disk_busy)
+        for button in (self.editor_button, self.training_button, self.single_button, self.ai_button):
+            enable(button, not busy)
+        if self.ai_pane is not None and self.active_workspace != "editor":
+            self.ai_pane._update_state()
         enable(self.import_button, has_project and not busy)
         enable(self.video_button, has_project and not busy)
         video = self.asset.get("video") if has_asset else None
@@ -1614,6 +1733,8 @@ class WizardApp:
         self.review_button.configure(text="改回待審核" if has_asset and self.asset.get("reviewed") else review_text)
 
     def close(self):
+        if self._generic_draft():
+            return
         if self.task_kind == "video":
             self.closing = True
             if self.video_import is not None and self.video_import.cancel():
@@ -1622,7 +1743,7 @@ class WizardApp:
             else:
                 self._message("畫格儲存完成後會關閉視窗。")
             return
-        if self.task_kind in {"import", "export"}:
+        if self.task_kind in {"import", "export", "generic_ai"}:
             self.closing = True
             self._message("檔案寫入完成後會關閉視窗。")
             return
@@ -1638,6 +1759,8 @@ def main(argv=None):
     parser.add_argument("--smoke-ui", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     root = tk.Tk()
+    if args.smoke_ui:
+        root.withdraw()
     app = WizardApp(root, args.model_dir)
     if args.project:
         app.open_path(args.project)

@@ -17,6 +17,8 @@ from uuid import uuid4
 import numpy as np
 from PIL import Image, ImageOps
 
+from grounding import DEFAULT_CANDIDATE_LIMIT, validate_candidate_limit
+
 
 _MANIFEST = "project.json"
 _LOCK = ".project.lock"
@@ -84,6 +86,13 @@ def _read_manifest(directory: Path) -> dict:
     if (not isinstance(labels, list) or any(not isinstance(name, str) or not name for name in labels)
             or len(labels) != len(set(labels)) or not isinstance(assets, list)):
         raise ValueError("專案記錄的類別或圖片清單無效。")
+    batch_classes = data.get("batch_class_settings", {})
+    if not isinstance(batch_classes, dict) or any(
+        label not in labels or not isinstance(settings, dict)
+        or not all(_is_batch_class_text(settings.get(field)) for field in ("prompt", "description"))
+        for label, settings in batch_classes.items()
+    ):
+        raise ValueError("專案記錄的批量類別設定無效。")
     seen = set()
     for asset in assets:
         if not isinstance(asset, dict):
@@ -102,6 +111,19 @@ def _asset(data: dict, asset_id: str) -> dict:
         if asset["id"] == asset_id:
             return asset
     raise ValueError("此圖片不在目前的標註專案內。")
+
+
+def _label_name(name: str) -> str:
+    if not isinstance(name, str):
+        raise ValueError("類別名稱必須是文字。")
+    name = name.strip()
+    if not name or not name.isprintable():
+        raise ValueError("請輸入有效的類別名稱。")
+    return name
+
+
+def _is_batch_class_text(value) -> bool:
+    return isinstance(value, str) and all(ord(char) >= 32 and char not in "\x85\u2028\u2029" for char in value)
 
 
 def _digest(path: Path) -> str:
@@ -158,6 +180,23 @@ def _box_geometry(asset: dict, box) -> dict:
         raise ValueError("偵測框必須位於圖片範圍內，並具有正寬度與高度。")
     width, height = right - left, bottom - top
     return {"bbox": [left, top, width, height], "area": width * height}
+
+
+def _mark_box_edit(asset, label, *, deleted_box=None):
+    asset.setdefault("bbox_review_by_class", {})[label] = {"status": "pending"}
+    if deleted_box is not None:
+        removal = {"label": label, "bbox": deleted_box}
+        removed = asset.setdefault("bbox_removed", [])
+        if removal not in removed:
+            removed.append(removal)
+
+
+def _box_review_revision(asset):
+    evidence = {key: asset.get(key) for key in ("reviewed", "bbox_review_labels", "bbox_review_by_class",
+                                                "bbox_removed", "ignore_regions", "unresolvable")}
+    evidence["annotations"] = [{key: box.get(key) for key in ("id", "type", "label", "bbox", "human_touched")}
+                               for box in asset["annotations"]]
+    return hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def _finite(value, name: str) -> float:
@@ -249,6 +288,11 @@ class Project:
     @property
     def labels(self) -> list[str]:
         return self._data["labels"].copy()
+
+    @property
+    def batch_class_settings(self) -> dict[str, dict[str, str]]:
+        """Return copies of editable defaults for subsequent batch jobs."""
+        return {label: settings.copy() for label, settings in self._data.get("batch_class_settings", {}).items()}
 
     def _commit(self, data: dict) -> None:
         _write_json(self.directory / _MANIFEST, data)
@@ -525,7 +569,10 @@ class Project:
             if label not in data["labels"]:
                 raise ValueError("請先選擇已建立的類別。")
             record = self._video_box(asset, annotation_id)
-            record.update(label=label, needs_label_review=False)
+            if record["label"] != label:
+                _mark_box_edit(asset, record["label"], deleted_box=record["bbox"])
+            record.update(label=label, needs_label_review=False, human_touched=True)
+            _mark_box_edit(asset, label)
             if asset["video"].get("sam_fill"):
                 asset["video"]["sam_fill_touched"] = True
             asset["reviewed"] = False
@@ -542,11 +589,7 @@ class Project:
             return video["cut_before"]
 
     def add_label(self, name: str) -> str:
-        if not isinstance(name, str):
-            raise ValueError("類別名稱必須是文字。")
-        name = name.strip()
-        if not name or not name.isprintable():
-            raise ValueError("請輸入有效的類別名稱。")
+        name = _label_name(name)
         with _project_lock(self.directory):
             data = _read_manifest(self.directory)
             if name not in data["labels"]:
@@ -555,6 +598,26 @@ class Project:
             else:
                 self._data = data
         return name
+
+    def save_batch_class(self, label: str, *, prompt: str = "", description: str = "") -> str:
+        """Register a project class and save its defaults in the same manifest update."""
+        label = _label_name(label)
+        if not _is_batch_class_text(prompt) or not _is_batch_class_text(description):
+            raise ValueError("找框提示與判斷說明必須是單行文字。")
+        defaults = {"prompt": prompt.strip(), "description": description.strip()}
+        with _project_lock(self.directory):
+            data = _read_manifest(self.directory)
+            if any(name != label and name.casefold() == label.casefold() for name in data["labels"]):
+                raise ValueError(f"類別名稱重複：{label}。")
+            if label not in data["labels"]:
+                data["labels"].append(label)
+            settings = data.setdefault("batch_class_settings", {})
+            if settings.get(label) != defaults:
+                settings[label] = defaults
+                self._commit(data)
+            else:
+                self._data = data
+        return label
 
     def add_annotation(self, asset_id: str, label: str, mask: np.ndarray,
                        source: str, score: float | None = None) -> str:
@@ -613,8 +676,11 @@ class Project:
                 self._commit(data)
         return prompt
 
-    def add_box(self, asset_id: str, label: str, box, *, suggestion=None, propagated=None, original_box=None) -> str:
-        """Save a confirmed detection box in original-image pixels."""
+    def add_box(self, asset_id: str, label: str, box, *, suggestion=None, propagated=None, original_box=None,
+                suggested_class=None, candidate_limit=DEFAULT_CANDIDATE_LIMIT) -> str:
+        """Save a confirmed box while preserving the model’s original suggestion."""
+        if suggested_class is not None and suggestion is None:
+            raise ValueError("候選建議類別缺少文字候選來源。")
         with _project_lock(self.directory):
             data = _read_manifest(self.directory)
             asset = _asset(data, asset_id)
@@ -622,15 +688,21 @@ class Project:
                 raise ValueError("請先選擇已建立的類別。")
             annotation_id = uuid4().hex
             record = {"id": annotation_id, "type": "bbox", "label": label,
-                      "source": "manual", "score": None, **_box_geometry(asset, box)}
+                      "source": "manual", "score": None, "human_touched": True, **_box_geometry(asset, box)}
             if suggestion is not None:
                 prompt, rank, score = suggestion
-                if not isinstance(prompt, str) or not prompt.strip() or type(rank) is not int or not 1 <= rank <= 5:
+                limit = validate_candidate_limit(candidate_limit)
+                if not isinstance(prompt, str) or not prompt.strip() or type(rank) is not int or not 1 <= rank <= limit:
                     raise ValueError("文字候選來源無效。")
                 score = _finite(score, "候選分數")
                 if not 0 <= score <= 1:
                     raise ValueError("候選分數無效。")
-                record.update(source="grounding_dino", score=score, suggestion={"prompt": prompt, "rank": rank})
+                provenance = {"prompt": prompt, "rank": rank}
+                if suggested_class is not None:
+                    if not isinstance(suggested_class, str) or suggested_class not in data["labels"]:
+                        raise ValueError("候選建議類別不在專案類別中。")
+                    provenance["suggested_class"] = suggested_class
+                record.update(source="grounding_dino", score=score, suggestion=provenance)
             if propagated is not None:
                 from video_fill import plan_fill
 
@@ -648,6 +720,7 @@ class Project:
                 record.setdefault("suggestion", {}).update(
                     original_xyxy=original, adjusted=geometry["bbox"] != record["bbox"])
             asset["annotations"].append(record)
+            _mark_box_edit(asset, label)
             asset["reviewed"] = False
             self._commit(data)
         return annotation_id
@@ -665,10 +738,12 @@ class Project:
             if geometry["bbox"] == annotation["bbox"]:
                 self._data = data
             else:
+                _mark_box_edit(asset, annotation["label"], deleted_box=annotation["bbox"])
                 annotation.update(geometry)
                 candidate = annotation.get("suggestion")
                 if candidate and "original_xyxy" in candidate:
                     candidate["adjusted"] = _box_geometry(asset, candidate["original_xyxy"])["bbox"] != geometry["bbox"]
+                annotation["human_touched"] = True
                 asset["reviewed"] = False
                 if annotation.get("source") == "sam_fill":
                     asset["video"]["keyframe"] = True
@@ -679,10 +754,12 @@ class Project:
         with _project_lock(self.directory):
             data = _read_manifest(self.directory)
             asset = _asset(data, asset_id)
-            remaining = [ann for ann in asset["annotations"] if ann["id"] != ann_id]
-            if len(remaining) == len(asset["annotations"]):
+            removed = next((ann for ann in asset["annotations"] if ann["id"] == ann_id), None)
+            if removed is None:
                 raise ValueError("找不到要移除的標註。")
-            asset["annotations"] = remaining
+            asset["annotations"] = [ann for ann in asset["annotations"] if ann["id"] != ann_id]
+            if removed.get("type") == "bbox":
+                _mark_box_edit(asset, removed["label"], deleted_box=removed["bbox"])
             asset["reviewed"] = False
             if (asset.get("video") or {}).get("sam_fill"):
                 asset["video"]["sam_fill_incomplete"] = True
@@ -698,9 +775,58 @@ class Project:
                 raise ValueError("請先選取待確認的框，指定類別後按「確認類別」。")
             if asset.get("reviewed", False) != reviewed:
                 asset["reviewed"] = reviewed
+                if reviewed:
+                    asset["bbox_review_labels"] = data["labels"].copy()
+                for label in asset.get("bbox_review_labels", []):
+                    asset.setdefault("bbox_review_by_class", {})[label] = {
+                        "status": "approved" if reviewed else "pending"}
                 self._commit(data)
             else:
                 self._data = data
+
+    def apply_batch_box_review(self, frame, labels, boxes, *, job_id, reviewed_at,
+                               status, expected_revision=None):
+        """Save the scoped whole-image decision and its editable boxes in one project revision."""
+        with _project_lock(self.directory):
+            data = _read_manifest(self.directory)
+            asset = _asset(data, frame["id"])
+            if asset.get("image_sha256", frame["image_sha256"]) != frame["image_sha256"]:
+                raise ValueError("畫格來源已變更，請重新載入批次。")
+            if expected_revision is not None and _box_review_revision(asset) != expected_revision:
+                raise ValueError("此圖的人工標註已有新版本，請捨棄草稿並重新載入再提交。")
+            confirmed = set(labels)
+            if status == "approved":
+                for label in labels:
+                    if label not in data["labels"]:
+                        data["labels"].append(label)
+                keep, previous = [], {}
+                for annotation in asset["annotations"]:
+                    if annotation.get("type") == "bbox" and annotation["label"] in confirmed:
+                        previous[annotation["label"], tuple(annotation["bbox"])] = annotation
+                    else:
+                        keep.append(annotation)
+                for box in boxes:
+                    geometry = _box_geometry(asset, box["xyxy"])
+                    original = previous.get((box["label"], tuple(geometry["bbox"])))
+                    if original is None:
+                        original = {"id": uuid4().hex, "type": "bbox", "label": box["label"],
+                                    "source": "manual", "score": None, **geometry}
+                    keep.append({**original, "human_touched": True})
+                asset["annotations"] = keep
+            review = asset.setdefault("bbox_review_by_class", {})
+            if asset.get("reviewed"):
+                previously_reviewed = asset.get("bbox_review_labels", data["labels"])
+                for label in set(previously_reviewed) - confirmed:
+                    review.setdefault(label, {"status": "approved"})
+            record = {"status": status, "job_id": job_id, "reviewed_at": reviewed_at}
+            for label in labels:
+                review[label] = record
+            approved = {label for label, entry in review.items() if entry["status"] == "approved"}
+            asset["reviewed"] = (status == "approved" and set(data["labels"]) <= approved
+                                 and not any(item.get("needs_label_review") for item in asset["annotations"]))
+            if asset["reviewed"]:
+                asset["bbox_review_labels"] = data["labels"].copy()
+            self._commit(data)
 
     @staticmethod
     def decode_mask(annotation: dict) -> np.ndarray:

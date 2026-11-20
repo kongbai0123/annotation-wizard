@@ -8,7 +8,10 @@ from pathlib import Path
 from PIL import Image
 
 
-MODEL_DIR = Path(__file__).resolve().parent.parent / "MM-Grounding-DINO-Tiny"
+ROOT = Path(__file__).resolve().parent
+MODEL_DIR = ROOT / "models" / "MM-Grounding-DINO-Tiny"
+DEFAULT_CANDIDATE_LIMIT = 5
+MAX_CANDIDATE_LIMIT = 100
 FILES = {
     "model.safetensors": "2d9bdfd0247f167a00e00fffa1dec1ee5d5861fdfb4e27fd8cc2279af6820688",
     "config.json": "cb8ffc83fa083aebe4a72d4714c759568b4001b32e28a1850e8c2f30c1db5923",
@@ -72,7 +75,14 @@ def load_model(directory, device):
     return processor, model.to(device).eval()
 
 
-def detect(processor, model, device, image, prompt):
+def validate_candidate_limit(value: int) -> int:
+    if type(value) is not int or not 1 <= value <= MAX_CANDIDATE_LIMIT:
+        raise ValueError(f"候選框數量必須為 1 至 {MAX_CANDIDATE_LIMIT} 的整數。")
+    return value
+
+
+def detect(processor, model, device, image, prompt, *, candidate_limit=DEFAULT_CANDIDATE_LIMIT):
+    candidate_limit = validate_candidate_limit(candidate_limit)
     import torch
     from torchvision.ops import nms
 
@@ -88,7 +98,7 @@ def detect(processor, model, device, image, prompt):
     keep = (torch.isfinite(boxes).all(dim=1) & torch.isfinite(scores)
             & (boxes[:, 2] - boxes[:, 0] >= 8) & (boxes[:, 3] - boxes[:, 1] >= 8))
     boxes, scores = boxes[keep], scores[keep]
-    order = nms(boxes, scores, 0.65)[:5]
+    order = nms(boxes, scores, 0.65)[:candidate_limit]
     return [(tuple(box), score) for box, score in zip(boxes[order].tolist(), scores[order].tolist(), strict=True)]
 
 
@@ -102,7 +112,11 @@ def overlap(a, b):
 
 class GroundingEngine:
     def __init__(self, directory=None):
-        self.directory = Path(directory or os.environ.get("ANNOTATION_WIZARD_DINO_DIR", MODEL_DIR)).resolve()
+        configured = directory or os.environ.get("ANNOTATION_WIZARD_DINO_DIR")
+        if configured is None:
+            old_location = ROOT.parent / MODEL_DIR.name
+            configured = old_location if not MODEL_DIR.exists() and old_location.is_dir() else MODEL_DIR
+        self.directory = Path(configured).resolve()
         self.model = None
         self.load_error = None
 
@@ -133,6 +147,7 @@ class GroundingEngine:
             raise RuntimeError(self.load_error) from exc
         self.processor, self.model, self.device = processor, model, device
 
-    def propose(self, image, prompt):
+    def propose(self, image, prompt, *, candidate_limit=DEFAULT_CANDIDATE_LIMIT):
+        candidate_limit = validate_candidate_limit(candidate_limit)
         self.ensure_loaded()
-        return detect(self.processor, self.model, self.device, image, prompt)
+        return detect(self.processor, self.model, self.device, image, prompt, candidate_limit=candidate_limit)

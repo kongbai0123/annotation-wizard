@@ -150,7 +150,7 @@ def _clock(seconds: float) -> str:
 
 
 class VideoReviewDialog:
-    def __init__(self, parent, path: Path):
+    def __init__(self, parent, path: Path, *, keyframes=False):
         self.window = tk.Toplevel(parent)
         self.window.title("審查影片")
         self.window.transient(parent)
@@ -173,7 +173,7 @@ class VideoReviewDialog:
         self.info = tk.StringVar(value="正在讀取影片和核對檔案內容…")
         self.thumb_text = tk.StringVar(value="等待預覽")
         self.model_text = tk.StringVar(value="尚未選擇模型")
-        self.keyframes = tk.BooleanVar(value=False)
+        self.keyframes = tk.BooleanVar(value=keyframes)
         self.sample = tk.StringVar(value="2")
         self.confidence = tk.StringVar(value="0.35")
         self.status = tk.StringVar(value="請先確認影片內容，再選擇對應類別的本機模型。")
@@ -229,6 +229,8 @@ class VideoReviewDialog:
 
         self.sample.trace_add("write", self._update_confirm)
         self.confidence.trace_add("write", self._update_confirm)
+        if keyframes:
+            self._change_mode()
         Thread(target=self._read, args=("video", 0, lambda: inspect_video(path, self.stop)), daemon=True).start()
         self.poll_id = self.window.after(60, self._collect)
 
